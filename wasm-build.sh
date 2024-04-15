@@ -218,10 +218,16 @@ rm -rf ${PGDATA} /tmp/initdb-*.log
 ${PREFIX}/initdb -k -g -N -U postgres --pwfile=${PREFIX}/password --locale=C --locale-provider=libc --pgdata=${PGDATA} 2> /tmp/initdb-\$\$.log
 echo "Ready to run sql command through ${PREFIX}/postgres"
 read
-tail -n +3 /tmp/initdb-\$\$.log  | head -n -2 > /tmp/initdb-\$\$
-rm /tmp/initdb-\$\$.log
-${PREFIX}/postgres --boot -d 1 -c log_checkpoints=false -X 16777216 -k < /tmp/initdb-\$\$ 2>&1 | grep -v 'bootstrap>'
-rm /tmp/initdb-\$\$
+
+grep -v ^initdb.js /tmp/initdb-\$\$.log \\
+ | tail -n +4 \\
+ | head -n -1 \\
+ > /tmp/initdb-\$\$.sql
+${PREFIX}/postgres --boot -d 1 -c log_checkpoints=false -X 16777216 -k < /tmp/initdb-\$\$.sql 2>&1 | grep -v 'bootstrap>'
+
+echo clean up
+read
+rm /tmp/initdb-\$\$.log /tmp/initdb-\$\$.sql
 END
 
 	chmod +x $PREFIX/*.sh
