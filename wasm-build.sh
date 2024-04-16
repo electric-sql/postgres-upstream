@@ -11,7 +11,7 @@ echo "
 
 "
 
-if echo "$@"|grep clean
+if echo "$@"|grep -q clean
 then
 	make clean
 	rm $(find |grep \\.js$) $(find |grep \\.wasm$)
@@ -21,20 +21,21 @@ then
 	fi
 fi
 
-if $CI
+if echo "$@"|grep -q patchwork
 then
     echo "
 
 
-                            applying patches
+        applying patchwork from https://github.com/pmp-p/postgres-patchwork/issues?q=is%3Aissue+is%3Aopen+label%3Apatch
 
 
 "
-    wget -O- https://github.com/pmp-p/postgres/commit/23a4a59d484ab18847f1848d29f1287551958c9e.diff | patch -p1
-
+    wget -O- https://patch-diff.githubusercontent.com/raw/pmp-p/postgres-patchwork/pull/2.diff | patch -p1
+    wget -O- https://patch-diff.githubusercontent.com/raw/pmp-p/postgres-patchwork/pull/5.diff | patch -p1
+    wget -O- https://patch-diff.githubusercontent.com/raw/pmp-p/postgres-patchwork/pull/7.diff | patch -p1
     sudo mkdir /pgdata
     sudo chmod 777 /pgdata
-
+    exit 0
 fi
 
 
@@ -215,18 +216,18 @@ END
 	cat >$PREFIX/initdb.sh <<END
 #!/bin/bash
 rm -rf ${PGDATA} /tmp/initdb-*.log
+TZ=UTC
 ${PREFIX}/initdb -k -g -N -U postgres --pwfile=${PREFIX}/password --locale=C --locale-provider=libc --pgdata=${PGDATA} 2> /tmp/initdb-\$\$.log
 echo "Ready to run sql command through ${PREFIX}/postgres"
-read
-
 grep -v ^initdb.js /tmp/initdb-\$\$.log \\
  | tail -n +4 \\
  | head -n -1 \\
  > /tmp/initdb-\$\$.sql
-${PREFIX}/postgres --boot -d 1 -c log_checkpoints=false -X 16777216 -k < /tmp/initdb-\$\$.sql 2>&1 | grep -v 'bootstrap>'
 
-echo clean up
-read
+md5sum /tmp/initdb-\$\$.sql
+
+${PREFIX}/postgres --boot -d 1 -c log_checkpoints=false -X 16777216 -k < /tmp/initdb-\$\$.sql 2>&1 | grep -v 'bootstrap>'
+echo cleaning up sql journal
 rm /tmp/initdb-\$\$.log /tmp/initdb-\$\$.sql
 END
 
@@ -243,19 +244,29 @@ END
 
 		chmod +x $PREFIX/*.sh
 
-
 		read
 
 		$PREFIX/initsql.sh
 		rm $PGDATA/postmaster.pid
-
-    	emcc -shared -o /srv/www/html/pygbag/pg/libpq.so \
- ./src/interfaces/libpq/libpq.a \
- ./src/port/libpgport.a \
- ./src/common/libpgcommon.a
-
 	fi
- # TZ=UTC node ./src/bin/initdb/initdb  -k -g -N -U postgres --pwfile=/date/git/pg/pw --locale=C --locale-provider=libc --pgdata=${PGDATA}
+
+    mkdir -p ${PREFIX}/lib
+    rm ${PREFIX}/lib/lib*.so.* ${PREFIX}/lib/libpq.so
+
+  	emcc -shared -o ${PREFIX}/lib/libpq.so \
+     ./src/interfaces/libpq/libpq.a \
+     ./src/port/libpgport.a \
+     ./src/common/libpgcommon.a
+
+    if [ -f /data/git/pg/local.sh ]
+    then
+        . /data/git/pg/local.sh
+    fi
+
+    echo "========================================================="
+
+    file ${PREFIX}/lib/lib*.so
+
 else
     echo build failed
 fi

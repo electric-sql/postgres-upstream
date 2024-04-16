@@ -23,10 +23,17 @@ jobs:
         curl https://wasmtime.dev/install.sh -sSf | bash
         mkdir -p /opt/python-wasm-sdk/wasisdk/bin
         mv -vf $(find $HOME/|grep /wasmtime$) /opt/python-wasm-sdk/wasisdk/bin/
+
       working-directory: /
+
+
+    - name: apply patchwork
+      run: |
+        chmod +x wasm-build.sh
+        bash ./wasm-build.sh patchwork
+
 
     - name: Build WASM with emsdk
       run: |
-        chmod +x wasm-build.sh
         bash ./wasm-build.sh
 
