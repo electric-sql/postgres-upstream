@@ -1006,10 +1006,7 @@ exprCollation(const Node *expr)
 			{
 				const JsonExpr *jsexpr = (JsonExpr *) expr;
 
-				if (jsexpr->coercion_expr)
-					coll = exprCollation(jsexpr->coercion_expr);
-				else
-					coll = jsexpr->collation;
+				coll = jsexpr->collation;
 			}
 			break;
 		case T_JsonBehavior:
@@ -1265,10 +1262,7 @@ exprSetCollation(Node *expr, Oid collation)
 			{
 				JsonExpr   *jexpr = (JsonExpr *) expr;
 
-				if (jexpr->coercion_expr)
-					exprSetCollation((Node *) jexpr->coercion_expr, collation);
-				else
-					jexpr->collation = collation;
+				jexpr->collation = collation;
 			}
 			break;
 		case T_JsonBehavior:
@@ -2163,6 +2157,16 @@ expression_tree_walker_impl(Node *node,
 					return true;
 				if (WALK(expr->aggfilter))
 					return true;
+				if (WALK(expr->runCondition))
+					return true;
+			}
+			break;
+		case T_WindowFuncRunCondition:
+			{
+				WindowFuncRunCondition *expr = (WindowFuncRunCondition *) node;
+
+				if (WALK(expr->arg))
+					return true;
 			}
 			break;
 		case T_SubscriptingRef:
@@ -2358,8 +2362,6 @@ expression_tree_walker_impl(Node *node,
 					return true;
 				if (WALK(jexpr->path_spec))
 					return true;
-				if (WALK(jexpr->coercion_expr))
-					return true;
 				if (WALK(jexpr->passing_values))
 					return true;
 				/* we assume walker doesn't care about passing_names */
@@ -2399,8 +2401,6 @@ expression_tree_walker_impl(Node *node,
 				if (WALK(wc->startOffset))
 					return true;
 				if (WALK(wc->endOffset))
-					return true;
-				if (WALK(wc->runCondition))
 					return true;
 			}
 			break;
@@ -2752,8 +2752,6 @@ query_tree_walker_impl(Query *query,
 				return true;
 			if (WALK(wc->endOffset))
 				return true;
-			if (WALK(wc->runCondition))
-				return true;
 		}
 	}
 
@@ -2855,6 +2853,11 @@ range_table_entry_walker_impl(RangeTblEntry *rte,
 		case RTE_NAMEDTUPLESTORE:
 		case RTE_RESULT:
 			/* nothing to do */
+			break;
+		case RTE_GROUP:
+			if (!(flags & QTW_IGNORE_GROUPEXPRS))
+				if (WALK(rte->groupexprs))
+					return true;
 			break;
 	}
 
@@ -3050,6 +3053,16 @@ expression_tree_mutator_impl(Node *node,
 				FLATCOPY(newnode, wfunc, WindowFunc);
 				MUTATE(newnode->args, wfunc->args, List *);
 				MUTATE(newnode->aggfilter, wfunc->aggfilter, Expr *);
+				return (Node *) newnode;
+			}
+			break;
+		case T_WindowFuncRunCondition:
+			{
+				WindowFuncRunCondition *wfuncrc = (WindowFuncRunCondition *) node;
+				WindowFuncRunCondition *newnode;
+
+				FLATCOPY(newnode, wfuncrc, WindowFuncRunCondition);
+				MUTATE(newnode->arg, wfuncrc->arg, Expr *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3395,7 +3408,6 @@ expression_tree_mutator_impl(Node *node,
 				FLATCOPY(newnode, jexpr, JsonExpr);
 				MUTATE(newnode->formatted_expr, jexpr->formatted_expr, Node *);
 				MUTATE(newnode->path_spec, jexpr->path_spec, Node *);
-				MUTATE(newnode->coercion_expr, jexpr->coercion_expr, Node *);
 				MUTATE(newnode->passing_values, jexpr->passing_values, List *);
 				/* assume mutator does not care about passing_names */
 				MUTATE(newnode->on_empty, jexpr->on_empty, JsonBehavior *);
@@ -3466,7 +3478,6 @@ expression_tree_mutator_impl(Node *node,
 				MUTATE(newnode->orderClause, wc->orderClause, List *);
 				MUTATE(newnode->startOffset, wc->startOffset, Node *);
 				MUTATE(newnode->endOffset, wc->endOffset, Node *);
-				MUTATE(newnode->runCondition, wc->runCondition, List *);
 				return (Node *) newnode;
 			}
 			break;
@@ -3799,7 +3810,6 @@ query_tree_mutator_impl(Query *query,
 			FLATCOPY(newnode, wc, WindowClause);
 			MUTATE(newnode->startOffset, wc->startOffset, Node *);
 			MUTATE(newnode->endOffset, wc->endOffset, Node *);
-			MUTATE(newnode->runCondition, wc->runCondition, List *);
 
 			resultlist = lappend(resultlist, (Node *) newnode);
 		}
@@ -3885,6 +3895,15 @@ range_table_mutator_impl(List *rtable,
 			case RTE_NAMEDTUPLESTORE:
 			case RTE_RESULT:
 				/* nothing to do */
+				break;
+			case RTE_GROUP:
+				if (!(flags & QTW_IGNORE_GROUPEXPRS))
+					MUTATE(newrte->groupexprs, rte->groupexprs, List *);
+				else
+				{
+					/* else, copy grouping exprs as-is */
+					newrte->groupexprs = copyObject(rte->groupexprs);
+				}
 				break;
 		}
 		MUTATE(newrte->securityQuals, rte->securityQuals, List *);

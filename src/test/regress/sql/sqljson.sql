@@ -138,6 +138,8 @@ SELECT JSON_OBJECT('a': '1', 'b': NULL, 'c': 2);
 SELECT JSON_OBJECT('a': '1', 'b': NULL, 'c': 2 NULL ON NULL);
 SELECT JSON_OBJECT('a': '1', 'b': NULL, 'c': 2 ABSENT ON NULL);
 
+SELECT JSON_OBJECT(1: 1, '2': NULL, '3': 1, repeat('x', 1000): 1, 2: repeat('a', 100) WITH UNIQUE);
+
 SELECT JSON_OBJECT(1: 1, '1': NULL WITH UNIQUE);
 SELECT JSON_OBJECT(1: 1, '1': NULL ABSENT ON NULL WITH UNIQUE);
 SELECT JSON_OBJECT(1: 1, '1': NULL NULL ON NULL WITH UNIQUE RETURNING jsonb);
@@ -282,6 +284,9 @@ FROM (VALUES (1, 1), (1, NULL), (2, 2)) foo(k, v);
 
 SELECT JSON_OBJECTAGG(k: v ABSENT ON NULL WITH UNIQUE KEYS RETURNING jsonb)
 FROM (VALUES (1, 1), (0, NULL),(4, null), (5, null),(6, null),(2, 2)) foo(k, v);
+
+SELECT JSON_OBJECTAGG(mod(i,100): (i)::text FORMAT JSON WITH UNIQUE)
+FROM generate_series(0, 199) i;
 
 -- Test JSON_OBJECT deparsing
 EXPLAIN (VERBOSE, COSTS OFF)
@@ -463,3 +468,15 @@ SELECT '1' IS JSON AS "any", ('1' || i) IS JSON SCALAR AS "scalar", '[]' IS NOT 
 \sv is_json_view
 
 DROP VIEW is_json_view;
+
+-- Test implicit coercion to a fixed-length type specified in RETURNING
+SELECT JSON_SERIALIZE('{ "a" : 1 } ' RETURNING varchar(2));
+SELECT JSON_OBJECT('a': JSON_OBJECT('b': 1 RETURNING varchar(2)));
+SELECT JSON_ARRAY(JSON_ARRAY('{ "a" : 123 }' RETURNING varchar(2)));
+SELECT JSON_ARRAYAGG(('111' || i)::bytea FORMAT JSON NULL ON NULL RETURNING varchar(2)) FROM generate_series(1,1) i;
+SELECT JSON_OBJECTAGG(i: ('111' || i)::bytea FORMAT JSON WITH UNIQUE RETURNING varchar(2)) FROM generate_series(1, 1) i;
+
+-- Now try domain over fixed-length type
+CREATE DOMAIN sqljson_char2 AS char(2) CHECK (VALUE NOT IN ('12'));
+SELECT JSON_SERIALIZE('123' RETURNING sqljson_char2);
+SELECT JSON_SERIALIZE('12' RETURNING sqljson_char2);

@@ -54,6 +54,7 @@
 #include "storage/ipc.h"
 #include "storage/lmgr.h"
 #include "storage/proc.h"
+#include "storage/read_stream.h"
 #include "storage/smgr.h"
 #include "storage/standby.h"
 #include "utils/memdebug.h"
@@ -1002,7 +1003,7 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 	if (buffer == InvalidBuffer)
 	{
 		Assert(extended_by == 0);
-		buffer = ReadBuffer_common(bmr.rel, bmr.smgr, 0,
+		buffer = ReadBuffer_common(bmr.rel, bmr.smgr, bmr.relpersistence,
 								   fork, extend_to - 1, mode, strategy);
 	}
 
@@ -1010,43 +1011,89 @@ ExtendBufferedRelTo(BufferManagerRelation bmr,
 }
 
 /*
- * Zero a buffer and lock it, as part of the implementation of
+ * Lock and optionally zero a buffer, as part of the implementation of
  * RBM_ZERO_AND_LOCK or RBM_ZERO_AND_CLEANUP_LOCK.  The buffer must be already
- * pinned.  It does not have to be valid, but it is valid and locked on
- * return.
+ * pinned.  If the buffer is not already valid, it is zeroed and made valid.
  */
 static void
-ZeroBuffer(Buffer buffer, ReadBufferMode mode)
+ZeroAndLockBuffer(Buffer buffer, ReadBufferMode mode, bool already_valid)
 {
 	BufferDesc *bufHdr;
-	uint32		buf_state;
+	bool		need_to_zero;
+	bool		isLocalBuf = BufferIsLocal(buffer);
 
 	Assert(mode == RBM_ZERO_AND_LOCK || mode == RBM_ZERO_AND_CLEANUP_LOCK);
 
-	if (BufferIsLocal(buffer))
+	if (already_valid)
+	{
+		/*
+		 * If the caller already knew the buffer was valid, we can skip some
+		 * header interaction.  The caller just wants to lock the buffer.
+		 */
+		need_to_zero = false;
+	}
+	else if (isLocalBuf)
+	{
+		/* Simple case for non-shared buffers. */
 		bufHdr = GetLocalBufferDescriptor(-buffer - 1);
+		need_to_zero = (pg_atomic_read_u32(&bufHdr->state) & BM_VALID) == 0;
+	}
 	else
 	{
+		/*
+		 * Take BM_IO_IN_PROGRESS, or discover that BM_VALID has been set
+		 * concurrently.  Even though we aren't doing I/O, that ensures that
+		 * we don't zero a page that someone else has pinned.  An exclusive
+		 * content lock wouldn't be enough, because readers are allowed to
+		 * drop the content lock after determining that a tuple is visible
+		 * (see buffer access rules in README).
+		 */
 		bufHdr = GetBufferDescriptor(buffer - 1);
+		need_to_zero = StartBufferIO(bufHdr, true, false);
+	}
+
+	if (need_to_zero)
+	{
+		memset(BufferGetPage(buffer), 0, BLCKSZ);
+
+		/*
+		 * Grab the buffer content lock before marking the page as valid, to
+		 * make sure that no other backend sees the zeroed page before the
+		 * caller has had a chance to initialize it.
+		 *
+		 * Since no-one else can be looking at the page contents yet, there is
+		 * no difference between an exclusive lock and a cleanup-strength
+		 * lock. (Note that we cannot use LockBuffer() or
+		 * LockBufferForCleanup() here, because they assert that the buffer is
+		 * already valid.)
+		 */
+		if (!isLocalBuf)
+			LWLockAcquire(BufferDescriptorGetContentLock(bufHdr), LW_EXCLUSIVE);
+
+		if (isLocalBuf)
+		{
+			/* Only need to adjust flags */
+			uint32		buf_state = pg_atomic_read_u32(&bufHdr->state);
+
+			buf_state |= BM_VALID;
+			pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
+		}
+		else
+		{
+			/* Set BM_VALID, terminate IO, and wake up any waiters */
+			TerminateBufferIO(bufHdr, false, BM_VALID, true);
+		}
+	}
+	else if (!isLocalBuf)
+	{
+		/*
+		 * The buffer is valid, so we can't zero it.  The caller still expects
+		 * the page to be locked on return.
+		 */
 		if (mode == RBM_ZERO_AND_LOCK)
 			LockBuffer(buffer, BUFFER_LOCK_EXCLUSIVE);
 		else
 			LockBufferForCleanup(buffer);
-	}
-
-	memset(BufferGetPage(buffer), 0, BLCKSZ);
-
-	if (BufferIsLocal(buffer))
-	{
-		buf_state = pg_atomic_read_u32(&bufHdr->state);
-		buf_state |= BM_VALID;
-		pg_atomic_unlocked_write_u32(&bufHdr->state, buf_state);
-	}
-	else
-	{
-		buf_state = LockBufHdr(bufHdr);
-		buf_state |= BM_VALID;
-		UnlockBufHdr(bufHdr, buf_state);
 	}
 }
 
@@ -1058,7 +1105,7 @@ ZeroBuffer(Buffer buffer, ReadBufferMode mode)
 static pg_attribute_always_inline Buffer
 PinBufferForBlock(Relation rel,
 				  SMgrRelation smgr,
-				  char smgr_persistence,
+				  char persistence,
 				  ForkNumber forkNum,
 				  BlockNumber blockNum,
 				  BufferAccessStrategy strategy,
@@ -1067,22 +1114,13 @@ PinBufferForBlock(Relation rel,
 	BufferDesc *bufHdr;
 	IOContext	io_context;
 	IOObject	io_object;
-	char		persistence;
 
 	Assert(blockNum != P_NEW);
 
-	/*
-	 * If there is no Relation it usually implies recovery and thus permanent,
-	 * but we take an argmument because CreateAndCopyRelationData can reach us
-	 * with only an SMgrRelation for an unlogged relation that we don't want
-	 * to flag with BM_PERMANENT.
-	 */
-	if (rel)
-		persistence = rel->rd_rel->relpersistence;
-	else if (smgr_persistence == 0)
-		persistence = RELPERSISTENCE_PERMANENT;
-	else
-		persistence = smgr_persistence;
+	/* Persistence should be set before */
+	Assert((persistence == RELPERSISTENCE_TEMP ||
+			persistence == RELPERSISTENCE_PERMANENT ||
+			persistence == RELPERSISTENCE_UNLOGGED));
 
 	if (persistence == RELPERSISTENCE_TEMP)
 	{
@@ -1127,7 +1165,6 @@ PinBufferForBlock(Relation rel,
 	}
 	if (*foundPtr)
 	{
-		VacuumPageHit++;
 		pgstat_count_io_op(io_object, io_context, IOOP_HIT);
 		if (VacuumCostActive)
 			VacuumCostBalance += VacuumCostPageHit;
@@ -1157,6 +1194,7 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 	ReadBuffersOperation operation;
 	Buffer		buffer;
 	int			flags;
+	char		persistence;
 
 	/*
 	 * Backward compatibility path, most code should use ExtendBufferedRel()
@@ -1178,14 +1216,19 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 		return ExtendBufferedRel(BMR_REL(rel), forkNum, strategy, flags);
 	}
 
+	if (rel)
+		persistence = rel->rd_rel->relpersistence;
+	else
+		persistence = smgr_persistence;
+
 	if (unlikely(mode == RBM_ZERO_AND_CLEANUP_LOCK ||
 				 mode == RBM_ZERO_AND_LOCK))
 	{
 		bool		found;
 
-		buffer = PinBufferForBlock(rel, smgr, smgr_persistence,
+		buffer = PinBufferForBlock(rel, smgr, persistence,
 								   forkNum, blockNum, strategy, &found);
-		ZeroBuffer(buffer, mode);
+		ZeroAndLockBuffer(buffer, mode, found);
 		return buffer;
 	}
 
@@ -1195,7 +1238,7 @@ ReadBuffer_common(Relation rel, SMgrRelation smgr, char smgr_persistence,
 		flags = 0;
 	operation.smgr = smgr;
 	operation.rel = rel;
-	operation.smgr_persistence = smgr_persistence;
+	operation.persistence = persistence;
 	operation.forknum = forkNum;
 	operation.strategy = strategy;
 	if (StartReadBuffer(&operation,
@@ -1226,7 +1269,7 @@ StartReadBuffersImpl(ReadBuffersOperation *operation,
 
 		buffers[i] = PinBufferForBlock(operation->rel,
 									   operation->smgr,
-									   operation->smgr_persistence,
+									   operation->persistence,
 									   operation->forknum,
 									   blockNum + i,
 									   operation->strategy,
@@ -1372,10 +1415,8 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 	buffers = &operation->buffers[0];
 	blocknum = operation->blocknum;
 	forknum = operation->forknum;
+	persistence = operation->persistence;
 
-	persistence = operation->rel
-		? operation->rel->rd_rel->relpersistence
-		: RELPERSISTENCE_PERMANENT;
 	if (persistence == RELPERSISTENCE_TEMP)
 	{
 		io_context = IOCONTEXT_NORMAL;
@@ -1519,7 +1560,6 @@ WaitReadBuffers(ReadBuffersOperation *operation)
 											  false);
 		}
 
-		VacuumPageMiss += io_buffers_len;
 		if (VacuumCostActive)
 			VacuumCostBalance += VacuumCostPageMiss * io_buffers_len;
 	}
@@ -2513,7 +2553,6 @@ MarkBufferDirty(Buffer buffer)
 	 */
 	if (!(old_buf_state & BM_DIRTY))
 	{
-		VacuumPageDirty++;
 		pgBufferUsage.shared_blks_dirtied++;
 		if (VacuumCostActive)
 			VacuumCostBalance += VacuumCostPageDirty;
@@ -3516,7 +3555,7 @@ AtEOXact_Buffers(bool isCommit)
  * buffer pool.
  */
 void
-InitBufferPoolAccess(void)
+InitBufferManagerAccess(void)
 {
 	HASHCTL		hash_ctl;
 
@@ -4644,6 +4683,9 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	PGIOAlignedBlock buf;
 	BufferAccessStrategy bstrategy_src;
 	BufferAccessStrategy bstrategy_dst;
+	BlockRangeReadStreamPrivate p;
+	ReadStream *src_stream;
+	SMgrRelation src_smgr;
 
 	/*
 	 * In general, we want to write WAL whenever wal_level > 'minimal', but we
@@ -4672,19 +4714,31 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 	bstrategy_src = GetAccessStrategy(BAS_BULKREAD);
 	bstrategy_dst = GetAccessStrategy(BAS_BULKWRITE);
 
+	/* Initialize streaming read */
+	p.current_blocknum = 0;
+	p.last_exclusive = nblocks;
+	src_smgr = smgropen(srclocator, INVALID_PROC_NUMBER);
+	src_stream = read_stream_begin_smgr_relation(READ_STREAM_FULL,
+												 bstrategy_src,
+												 src_smgr,
+												 permanent ? RELPERSISTENCE_PERMANENT : RELPERSISTENCE_UNLOGGED,
+												 forkNum,
+												 block_range_read_stream_cb,
+												 &p,
+												 0);
+
 	/* Iterate over each block of the source relation file. */
 	for (blkno = 0; blkno < nblocks; blkno++)
 	{
 		CHECK_FOR_INTERRUPTS();
 
 		/* Read block from source relation. */
-		srcBuf = ReadBufferWithoutRelcache(srclocator, forkNum, blkno,
-										   RBM_NORMAL, bstrategy_src,
-										   permanent);
+		srcBuf = read_stream_next_buffer(src_stream, NULL);
 		LockBuffer(srcBuf, BUFFER_LOCK_SHARE);
 		srcPage = BufferGetPage(srcBuf);
 
-		dstBuf = ReadBufferWithoutRelcache(dstlocator, forkNum, blkno,
+		dstBuf = ReadBufferWithoutRelcache(dstlocator, forkNum,
+										   BufferGetBlockNumber(srcBuf),
 										   RBM_ZERO_AND_LOCK, bstrategy_dst,
 										   permanent);
 		dstPage = BufferGetPage(dstBuf);
@@ -4704,6 +4758,8 @@ RelationCopyStorageUsingBuffer(RelFileLocator srclocator,
 		UnlockReleaseBuffer(dstBuf);
 		UnlockReleaseBuffer(srcBuf);
 	}
+	Assert(read_stream_next_buffer(src_stream, NULL) == InvalidBuffer);
+	read_stream_end(src_stream);
 
 	FreeAccessStrategy(bstrategy_src);
 	FreeAccessStrategy(bstrategy_dst);
@@ -5036,7 +5092,6 @@ MarkBufferDirtyHint(Buffer buffer, bool buffer_std)
 
 		if (dirtied)
 		{
-			VacuumPageDirty++;
 			pgBufferUsage.shared_blks_dirtied++;
 			if (VacuumCostActive)
 				VacuumCostBalance += VacuumCostPageDirty;

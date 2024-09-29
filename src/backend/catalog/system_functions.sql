@@ -5,7 +5,7 @@
  *
  * src/backend/catalog/system_functions.sql
  *
- * This file redefines certain built-in functions that it's impractical
+ * This file redefines certain built-in functions that are impractical
  * to fully define in pg_proc.dat.  In most cases that's because they use
  * SQL-standard function bodies and/or default expressions.  The node
  * tree representations of those are too unreadable, platform-dependent,
@@ -414,6 +414,9 @@ CREATE OR REPLACE FUNCTION
   json_populate_recordset(base anyelement, from_json json, use_json_as_text boolean DEFAULT false)
   RETURNS SETOF anyelement LANGUAGE internal STABLE ROWS 100  AS 'json_populate_recordset' PARALLEL SAFE;
 
+CREATE OR REPLACE PROCEDURE pg_wal_replay_wait(target_lsn pg_lsn, timeout int8 DEFAULT 0)
+  LANGUAGE internal AS 'pg_wal_replay_wait';
+
 CREATE OR REPLACE FUNCTION pg_logical_slot_get_changes(
     IN slot_name name, IN upto_lsn pg_lsn, IN upto_nchanges int, VARIADIC options text[] DEFAULT '{}',
     OUT lsn pg_lsn, OUT xid xid, OUT data text)
@@ -681,7 +684,7 @@ REVOKE EXECUTE ON FUNCTION pg_stat_reset_single_function_counters(oid) FROM publ
 
 REVOKE EXECUTE ON FUNCTION pg_stat_reset_replication_slot(text) FROM public;
 
-REVOKE EXECUTE ON FUNCTION pg_stat_have_stats(text, oid, oid) FROM public;
+REVOKE EXECUTE ON FUNCTION pg_stat_have_stats(text, oid, int8) FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_stat_reset_subscription_stats(oid) FROM public;
 

@@ -2,6 +2,7 @@
 CATALOG_NAME     = libpq
 GETTEXT_FILES    = fe-auth.c \
                    fe-auth-scram.c \
+                   fe-cancel.c \
                    fe-connect.c \
                    fe-exec.c \
                    fe-gssapi-common.c \
@@ -12,8 +13,7 @@ GETTEXT_FILES    = fe-auth.c \
                    fe-secure-common.c \
                    fe-secure-gssapi.c \
                    fe-secure-openssl.c \
-                   win32.c \
-                   ../../port/user.c
+                   win32.c
 GETTEXT_TRIGGERS = libpq_append_conn_error:2 \
                    libpq_append_error:2 \
                    libpq_gettext \

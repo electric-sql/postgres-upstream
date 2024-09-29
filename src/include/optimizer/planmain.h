@@ -20,7 +20,6 @@
 /* GUC parameters */
 #define DEFAULT_CURSOR_TUPLE_FRACTION 0.1
 extern PGDLLIMPORT double cursor_tuple_fraction;
-extern PGDLLIMPORT bool enable_self_join_removal;
 
 /* query_planner callback to compute query_pathkeys */
 typedef void (*query_pathkeys_callback) (PlannerInfo *root, void *extra);
@@ -73,7 +72,10 @@ extern void add_other_rels_to_query(PlannerInfo *root);
 extern void build_base_rel_tlists(PlannerInfo *root, List *final_tlist);
 extern void add_vars_to_targetlist(PlannerInfo *root, List *vars,
 								   Relids where_needed);
+extern void add_vars_to_attr_needed(PlannerInfo *root, List *vars,
+									Relids where_needed);
 extern void find_lateral_references(PlannerInfo *root);
+extern void rebuild_lateral_attr_needed(PlannerInfo *root);
 extern void create_lateral_join_info(PlannerInfo *root);
 extern List *deconstruct_jointree(PlannerInfo *root);
 extern bool restriction_is_always_true(PlannerInfo *root,
@@ -97,6 +99,7 @@ extern RestrictInfo *build_implied_join_equality(PlannerInfo *root,
 												 Expr *item2,
 												 Relids qualscope,
 												 Index security_level);
+extern void rebuild_joinclause_attr_needed(PlannerInfo *root);
 extern void match_foreign_keys_to_quals(PlannerInfo *root);
 
 /*
@@ -109,11 +112,6 @@ extern bool query_is_distinct_for(Query *query, List *colnos, List *opids);
 extern bool innerrel_is_unique(PlannerInfo *root,
 							   Relids joinrelids, Relids outerrelids, RelOptInfo *innerrel,
 							   JoinType jointype, List *restrictlist, bool force_cache);
-extern bool innerrel_is_unique_ext(PlannerInfo *root, Relids joinrelids,
-								   Relids outerrelids, RelOptInfo *innerrel,
-								   JoinType jointype, List *restrictlist,
-								   bool force_cache, List **uclauses);
-extern List *remove_useless_self_joins(PlannerInfo *root, List *jointree);
 
 /*
  * prototypes for plan/setrefs.c

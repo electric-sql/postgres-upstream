@@ -36,16 +36,20 @@ PostgreSQL documentation
   <title>Description</title>
 
   <para>
-   <application>pg_dump</application> is a utility for backing up a
+   <application>pg_dump</application> is a utility for exporting a
    <productname>PostgreSQL</productname> database. It makes consistent
-   backups even if the database is being used concurrently.
+   exports even if the database is being used concurrently.
    <application>pg_dump</application> does not block other users
    accessing the database (readers or writers).
+   Note, however, that except in simple cases,
+   <application>pg_dump</application> is generally not the right choice for
+   taking regular backups of production databases.  See <xref
+   linkend="backup"/> for further discussion.
   </para>
 
   <para>
    <application>pg_dump</application> only dumps a single database.
-   To back up an entire cluster, or to back up global objects that are
+   To export an entire cluster, or to export global objects that are
    common to all databases in a cluster (such as roles and tablespaces),
    use <xref linkend="app-pg-dumpall"/>.
   </para>
@@ -76,7 +80,7 @@ PostgreSQL documentation
    <application>pg_restore</application>,
    <application>pg_dump</application> provides a flexible archival and
    transfer mechanism. <application>pg_dump</application> can be used to
-   backup an entire database, then <application>pg_restore</application>
+   export an entire database, then <application>pg_restore</application>
    can be used to examine the archive and/or select which parts of the
    database are to be restored. The most flexible output file formats are
    the <quote>custom</quote> format (<option>-Fc</option>) and the
@@ -253,27 +257,6 @@ PostgreSQL documentation
          into a clean database.
         </para>
        </note>
-      </listitem>
-     </varlistentry>
-
-     <varlistentry>
-      <term><option>--exclude-extension=<replaceable class="parameter">pattern</replaceable></option></term>
-      <listitem>
-       <para>
-        Do not dump any extensions matching <replaceable
-        class="parameter">pattern</replaceable>.  The pattern is
-        interpreted according to the same rules as for <option>-e</option>.
-        <option>--exclude-extension</option> can be given more than once to exclude extensions
-        matching any of several patterns.
-       </para>
-
-       <para>
-        When both <option>-e</option> and <option>--exclude-extension</option> are given, the behavior
-        is to dump just the extensions that match at least one <option>-e</option>
-        switch but no <option>--exclude-extension</option> switches.  If <option>--exclude-extension</option>
-        appears without <option>-e</option>, then extensions matching <option>--exclude-extension</option> are
-        excluded from what is otherwise a normal dump.
-       </para>
       </listitem>
      </varlistentry>
 
@@ -804,6 +787,27 @@ PostgreSQL documentation
      </varlistentry>
 
      <varlistentry>
+      <term><option>--exclude-extension=<replaceable class="parameter">pattern</replaceable></option></term>
+      <listitem>
+       <para>
+        Do not dump any extensions matching <replaceable
+        class="parameter">pattern</replaceable>.  The pattern is
+        interpreted according to the same rules as for <option>-e</option>.
+        <option>--exclude-extension</option> can be given more than once to exclude extensions
+        matching any of several patterns.
+       </para>
+
+       <para>
+        When both <option>-e</option> and <option>--exclude-extension</option> are given, the behavior
+        is to dump just the extensions that match at least one <option>-e</option>
+        switch but no <option>--exclude-extension</option> switches.  If <option>--exclude-extension</option>
+        appears without <option>-e</option>, then extensions matching <option>--exclude-extension</option> are
+        excluded from what is otherwise a normal dump.
+       </para>
+      </listitem>
+     </varlistentry>
+
+     <varlistentry>
       <term><option>--exclude-table-and-children=<replaceable class="parameter">pattern</replaceable></option></term>
       <listitem>
        <para>
@@ -866,13 +870,14 @@ PostgreSQL documentation
         same rules as the corresponding options:
         <option>-t</option>/<option>--table</option>,
         <option>--table-and-children</option>,
-        <option>--exclude-table-and-children</option> or
-        <option>-T</option> for tables,
-        <option>-n</option>/<option>--schema</option> for schemas,
+        <option>-T</option>/<option>--exclude-table</option>, and
+        <option>--exclude-table-and-children</option> for tables,
+        <option>-n</option>/<option>--schema</option> and
+        <option>-N</option>/<option>--exclude-schema</option> for schemas,
         <option>--include-foreign-data</option> for data on foreign servers,
-        <option>--exclude-table-data</option>,
+        <option>--exclude-table-data</option> and
         <option>--exclude-table-data-and-children</option> for table data, and
-        <option>-e</option>/<option>--extension</option> or
+        <option>-e</option>/<option>--extension</option> and
         <option>--exclude-extension</option> for extensions.
         To read from <literal>STDIN</literal>, use <filename>-</filename> as the
         filename.  The <option>--filter</option> option can be specified in
@@ -895,34 +900,37 @@ PostgreSQL documentation
         <itemizedlist>
          <listitem>
           <para>
-           <literal>extension</literal>: extensions, works like the
-           <option>-e</option>/<option>--extension</option> option.
+           <literal>extension</literal>: extensions. This works like the
+           <option>-e</option>/<option>--extension</option> or
+           <option>--exclude-extension</option> option.
           </para>
          </listitem>
          <listitem>
           <para>
-           <literal>foreign_data</literal>: data on foreign servers, works like
+           <literal>foreign_data</literal>: data on foreign servers. This works like
            the <option>--include-foreign-data</option> option. This keyword can
            only be used with the <literal>include</literal> keyword.
           </para>
          </listitem>
          <listitem>
           <para>
-           <literal>table</literal>: tables, works like the
-           <option>-t</option>/<option>--table</option> option.
+           <literal>table</literal>: tables. This works like the
+           <option>-t</option>/<option>--table</option> or
+           <option>-T</option>/<option>--exclude-table</option> option.
           </para>
          </listitem>
          <listitem>
           <para>
            <literal>table_and_children</literal>: tables including any partitions
-           or inheritance child tables, works like the
-           <option>--table-and-children</option> option.
+           or inheritance child tables. This works like the
+           <option>--table-and-children</option> or
+           <option>--exclude-table-and-children</option> option.
           </para>
          </listitem>
          <listitem>
           <para>
            <literal>table_data</literal>: table data of any tables matching
-           <replaceable>pattern</replaceable>, works like the
+           <replaceable>pattern</replaceable>. This works like the
            <option>--exclude-table-data</option> option. This keyword can only
            be used with the <literal>exclude</literal> keyword.
           </para>
@@ -931,15 +939,16 @@ PostgreSQL documentation
           <para>
            <literal>table_data_and_children</literal>: table data of any tables
            matching <replaceable>pattern</replaceable> as well as any partitions
-           or inheritance children of the table(s), works like the
+           or inheritance children of the table(s). This works like the
            <option>--exclude-table-data-and-children</option> option. This
            keyword can only be used with the <literal>exclude</literal> keyword.
           </para>
          </listitem>
          <listitem>
           <para>
-           <literal>schema</literal>: schemas, works like the
-           <option>-n</option>/<option>--schema</option> option.
+           <literal>schema</literal>: schemas. This works like the
+           <option>-n</option>/<option>--schema</option> or
+           <option>-N</option>/<option>--exclude-schema</option> option.
           </para>
          </listitem>
         </itemizedlist>
@@ -991,6 +1000,14 @@ PostgreSQL documentation
         <xref linkend="pg-dump-examples"/> below.
         The only exception is that an empty pattern is disallowed.
        </para>
+
+       <note>
+        <para>
+         Using wildcards in <option>--include-foreign-data</option> may result
+         in access to unexpected foreign servers. Also, to use this option securely,
+         make sure that the named server must have a trusted owner.
+        </para>
+       </note>
 
        <note>
         <para>
@@ -1611,11 +1628,7 @@ CREATE DATABASE foo WITH TEMPLATE template0;
    dump can be restored without requiring network access to the remote
    servers.  It is then up to the user to reactivate the subscriptions in a
    suitable way.  If the involved hosts have changed, the connection
-   information might have to be changed.  If the subscription needs to
-   be enabled for
-   <link linkend="sql-createsubscription-params-with-failover"><literal>failover</literal></link>,
-   execute <link linkend="sql-altersubscription-params-set"><literal>ALTER SUBSCRIPTION ... SET (failover = true)</literal></link>
-   after the slot has been created.  It might also be appropriate to
+   information might have to be changed.  It might also be appropriate to
    truncate the target tables before initiating a new full table copy.  If users
    intend to copy initial data during refresh they must create the slot with
    <literal>two_phase = false</literal>.  After the initial sync, the

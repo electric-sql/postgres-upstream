@@ -19,6 +19,7 @@
 #include "access/relscan.h"
 #include "access/table.h"
 #include "access/xact.h"
+#include "catalog/catalog.h"
 #include "catalog/pg_collation.h"
 #include "catalog/pg_type.h"
 #include "common/hashfn.h"
@@ -1193,7 +1194,7 @@ InitCatCachePhase2(CatCache *cache, bool touch_index)
  *		catalogs' indexes.
  */
 static bool
-IndexScanOK(CatCache *cache, ScanKey cur_skey)
+IndexScanOK(CatCache *cache)
 {
 	switch (cache->id)
 	{
@@ -1467,22 +1468,21 @@ SearchCatCacheMiss(CatCache *cache,
 	 */
 	relation = table_open(cache->cc_reloid, AccessShareLock);
 
+	/*
+	 * Ok, need to make a lookup in the relation, copy the scankey and fill
+	 * out any per-call fields.
+	 */
+	memcpy(cur_skey, cache->cc_skey, sizeof(ScanKeyData) * nkeys);
+	cur_skey[0].sk_argument = v1;
+	cur_skey[1].sk_argument = v2;
+	cur_skey[2].sk_argument = v3;
+	cur_skey[3].sk_argument = v4;
+
 	do
 	{
-		/*
-		 * Ok, need to make a lookup in the relation, copy the scankey and
-		 * fill out any per-call fields.  (We must re-do this when retrying,
-		 * because systable_beginscan scribbles on the scankey.)
-		 */
-		memcpy(cur_skey, cache->cc_skey, sizeof(ScanKeyData) * nkeys);
-		cur_skey[0].sk_argument = v1;
-		cur_skey[1].sk_argument = v2;
-		cur_skey[2].sk_argument = v3;
-		cur_skey[3].sk_argument = v4;
-
 		scandesc = systable_beginscan(relation,
 									  cache->cc_indexoid,
-									  IndexScanOK(cache, cur_skey),
+									  IndexScanOK(cache),
 									  NULL,
 									  nkeys,
 									  cur_skey);
@@ -1787,22 +1787,21 @@ SearchCatCacheList(CatCache *cache,
 
 		relation = table_open(cache->cc_reloid, AccessShareLock);
 
+		/*
+		 * Ok, need to make a lookup in the relation, copy the scankey and
+		 * fill out any per-call fields.
+		 */
+		memcpy(cur_skey, cache->cc_skey, sizeof(ScanKeyData) * cache->cc_nkeys);
+		cur_skey[0].sk_argument = v1;
+		cur_skey[1].sk_argument = v2;
+		cur_skey[2].sk_argument = v3;
+		cur_skey[3].sk_argument = v4;
+
 		do
 		{
-			/*
-			 * Ok, need to make a lookup in the relation, copy the scankey and
-			 * fill out any per-call fields.  (We must re-do this when
-			 * retrying, because systable_beginscan scribbles on the scankey.)
-			 */
-			memcpy(cur_skey, cache->cc_skey, sizeof(ScanKeyData) * cache->cc_nkeys);
-			cur_skey[0].sk_argument = v1;
-			cur_skey[1].sk_argument = v2;
-			cur_skey[2].sk_argument = v3;
-			cur_skey[3].sk_argument = v4;
-
 			scandesc = systable_beginscan(relation,
 										  cache->cc_indexoid,
-										  IndexScanOK(cache, cur_skey),
+										  IndexScanOK(cache),
 										  NULL,
 										  nkeys,
 										  cur_skey);
@@ -2008,6 +2007,23 @@ ReleaseCatCacheListWithOwner(CatCList *list, ResourceOwner resowner)
 
 
 /*
+ * equalTuple
+ *		Are these tuples memcmp()-equal?
+ */
+static bool
+equalTuple(HeapTuple a, HeapTuple b)
+{
+	uint32		alen;
+	uint32		blen;
+
+	alen = a->t_len;
+	blen = b->t_len;
+	return (alen == blen &&
+			memcmp((char *) a->t_data,
+				   (char *) b->t_data, blen) == 0);
+}
+
+/*
  * CatalogCacheCreateEntry
  *		Create a new CatCTup entry, copying the given HeapTuple and other
  *		supplied data into it.  The new entry initially has refcount 0.
@@ -2057,14 +2073,34 @@ CatalogCacheCreateEntry(CatCache *cache, HeapTuple ntp, SysScanDesc scandesc,
 		 */
 		if (HeapTupleHasExternal(ntp))
 		{
+			bool		need_cmp = IsInplaceUpdateOid(cache->cc_reloid);
+			HeapTuple	before = NULL;
+			bool		matches = true;
+
+			if (need_cmp)
+				before = heap_copytuple(ntp);
 			dtp = toast_flatten_tuple(ntp, cache->cc_tupdesc);
 
 			/*
 			 * The tuple could become stale while we are doing toast table
-			 * access (since AcceptInvalidationMessages can run then), so we
-			 * must recheck its visibility afterwards.
+			 * access (since AcceptInvalidationMessages can run then).
+			 * equalTuple() detects staleness from inplace updates, while
+			 * systable_recheck_tuple() detects staleness from normal updates.
+			 *
+			 * While this equalTuple() follows the usual rule of reading with
+			 * a pin and no buffer lock, it warrants suspicion since an
+			 * inplace update could appear at any moment.  It's safe because
+			 * the inplace update sends an invalidation that can't reorder
+			 * before the inplace heap change.  If the heap change reaches
+			 * this process just after equalTuple() looks, we've not missed
+			 * its inval.
 			 */
-			if (!systable_recheck_tuple(scandesc, ntp))
+			if (need_cmp)
+			{
+				matches = equalTuple(before, ntp);
+				heap_freetuple(before);
+			}
+			if (!matches || !systable_recheck_tuple(scandesc, ntp))
 			{
 				heap_freetuple(dtp);
 				return NULL;

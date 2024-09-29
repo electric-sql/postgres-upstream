@@ -91,9 +91,6 @@
 #endif
 
 
-/* We use the ShmemLock spinlock to protect LWLockCounter */
-extern slock_t *ShmemLock;
-
 #define LW_FLAG_HAS_WAITERS			((uint32) 1 << 30)
 #define LW_FLAG_RELEASE_OK			((uint32) 1 << 29)
 #define LW_FLAG_LOCKED				((uint32) 1 << 28)
@@ -161,7 +158,7 @@ static const char *const BuiltinTrancheNames[] = {
 	[LWTRANCHE_LAUNCHER_HASH] = "LogicalRepLauncherHash",
 	[LWTRANCHE_DSM_REGISTRY_DSA] = "DSMRegistryDSA",
 	[LWTRANCHE_DSM_REGISTRY_HASH] = "DSMRegistryHash",
-	[LWTRANCHE_COMMITTS_SLRU] = "CommitTSSLRU",
+	[LWTRANCHE_COMMITTS_SLRU] = "CommitTsSLRU",
 	[LWTRANCHE_MULTIXACTOFFSET_SLRU] = "MultixactOffsetSLRU",
 	[LWTRANCHE_MULTIXACTMEMBER_SLRU] = "MultixactMemberSLRU",
 	[LWTRANCHE_NOTIFY_SLRU] = "NotifySLRU",
@@ -609,6 +606,7 @@ LWLockNewTrancheId(void)
 	int		   *LWLockCounter;
 
 	LWLockCounter = (int *) ((char *) MainLWLockArray - sizeof(int));
+	/* We use the ShmemLock spinlock to protect LWLockCounter */
 	SpinLockAcquire(ShmemLock);
 	result = (*LWLockCounter)++;
 	SpinLockRelease(ShmemLock);

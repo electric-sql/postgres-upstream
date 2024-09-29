@@ -31,10 +31,10 @@ static void pg_attribute_noreturn() pg_fatal_impl(int line, const char *fmt,...)
 static bool process_result(PGconn *conn, PGresult *res, int results,
 						   int numsent);
 
-const char *const progname = "libpq_pipeline";
+static const char *const progname = "libpq_pipeline";
 
 /* Options and defaults */
-char	   *tracefile = NULL;	/* path to PQtrace() file */
+static char *tracefile = NULL;	/* path to PQtrace() file */
 
 
 #ifdef DEBUG_OUTPUT
@@ -2227,10 +2227,10 @@ main(int argc, char **argv)
 
 	res = PQexec(conn, "SET lc_messages TO \"C\"");
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pg_fatal("failed to set lc_messages: %s", PQerrorMessage(conn));
+		pg_fatal("failed to set \"lc_messages\": %s", PQerrorMessage(conn));
 	res = PQexec(conn, "SET debug_parallel_query = off");
 	if (PQresultStatus(res) != PGRES_COMMAND_OK)
-		pg_fatal("failed to set debug_parallel_query: %s", PQerrorMessage(conn));
+		pg_fatal("failed to set \"debug_parallel_query\": %s", PQerrorMessage(conn));
 
 	/* Set the trace file, if requested */
 	if (tracefile != NULL)

@@ -13,7 +13,7 @@
  * autovacuum_work_mem) memory space to keep track of dead TIDs.  If the
  * TID store is full, we must call lazy_vacuum to vacuum indexes (and to vacuum
  * the pages that we've pruned). This frees up the memory space dedicated to
- * to store dead TIDs.
+ * store dead TIDs.
  *
  * In practice VACUUM will often complete its initial pass over the target
  * heap relation without ever running out of space to store TIDs.  This means
@@ -246,7 +246,7 @@ static void lazy_vacuum(LVRelState *vacrel);
 static bool lazy_vacuum_all_indexes(LVRelState *vacrel);
 static void lazy_vacuum_heap_rel(LVRelState *vacrel);
 static void lazy_vacuum_heap_page(LVRelState *vacrel, BlockNumber blkno,
-								  Buffer buffer, OffsetNumber *offsets,
+								  Buffer buffer, OffsetNumber *deadoffsets,
 								  int num_offsets, Buffer vmbuffer);
 static bool lazy_check_wraparound_failsafe(LVRelState *vacrel);
 static void lazy_cleanup_all_indexes(LVRelState *vacrel);
@@ -309,9 +309,7 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	PgStat_Counter startreadtime = 0,
 				startwritetime = 0;
 	WalUsage	startwalusage = pgWalUsage;
-	int64		StartPageHit = VacuumPageHit,
-				StartPageMiss = VacuumPageMiss,
-				StartPageDirty = VacuumPageDirty;
+	BufferUsage startbufferusage = pgBufferUsage;
 	ErrorContextCallback errcallback;
 	char	  **indnames = NULL;
 
@@ -440,13 +438,13 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 	 * as an upper bound on the XIDs stored in the pages we'll actually scan
 	 * (NewRelfrozenXid tracking must never be allowed to miss unfrozen XIDs).
 	 *
-	 * Next acquire vistest, a related cutoff that's used in pruning.  We
-	 * expect vistest will always make heap_page_prune_and_freeze() remove any
-	 * deleted tuple whose xmax is < OldestXmin.  lazy_scan_prune must never
-	 * become confused about whether a tuple should be frozen or removed.  (In
-	 * the future we might want to teach lazy_scan_prune to recompute vistest
-	 * from time to time, to increase the number of dead tuples it can prune
-	 * away.)
+	 * Next acquire vistest, a related cutoff that's used in pruning.  We use
+	 * vistest in combination with OldestXmin to ensure that
+	 * heap_page_prune_and_freeze() always removes any deleted tuple whose
+	 * xmax is < OldestXmin.  lazy_scan_prune must never become confused about
+	 * whether a tuple should be frozen or removed.  (In the future we might
+	 * want to teach lazy_scan_prune to recompute vistest from time to time,
+	 * to increase the number of dead tuples it can prune away.)
 	 */
 	vacrel->aggressive = vacuum_get_cutoffs(rel, params, &vacrel->cutoffs);
 	vacrel->rel_pages = orig_rel_pages = RelationGetNumberOfBlocks(rel);
@@ -604,18 +602,28 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 			long		secs_dur;
 			int			usecs_dur;
 			WalUsage	walusage;
+			BufferUsage bufferusage;
 			StringInfoData buf;
 			char	   *msgfmt;
 			int32		diff;
-			int64		PageHitOp = VacuumPageHit - StartPageHit,
-						PageMissOp = VacuumPageMiss - StartPageMiss,
-						PageDirtyOp = VacuumPageDirty - StartPageDirty;
 			double		read_rate = 0,
 						write_rate = 0;
+			int64		total_blks_hit;
+			int64		total_blks_read;
+			int64		total_blks_dirtied;
 
 			TimestampDifference(starttime, endtime, &secs_dur, &usecs_dur);
 			memset(&walusage, 0, sizeof(WalUsage));
 			WalUsageAccumDiff(&walusage, &pgWalUsage, &startwalusage);
+			memset(&bufferusage, 0, sizeof(BufferUsage));
+			BufferUsageAccumDiff(&bufferusage, &pgBufferUsage, &startbufferusage);
+
+			total_blks_hit = bufferusage.shared_blks_hit +
+				bufferusage.local_blks_hit;
+			total_blks_read = bufferusage.shared_blks_read +
+				bufferusage.local_blks_read;
+			total_blks_dirtied = bufferusage.shared_blks_dirtied +
+				bufferusage.local_blks_dirtied;
 
 			initStringInfo(&buf);
 			if (verbose)
@@ -742,18 +750,18 @@ heap_vacuum_rel(Relation rel, VacuumParams *params,
 			}
 			if (secs_dur > 0 || usecs_dur > 0)
 			{
-				read_rate = (double) BLCKSZ * PageMissOp / (1024 * 1024) /
-					(secs_dur + usecs_dur / 1000000.0);
-				write_rate = (double) BLCKSZ * PageDirtyOp / (1024 * 1024) /
-					(secs_dur + usecs_dur / 1000000.0);
+				read_rate = (double) BLCKSZ * total_blks_read /
+					(1024 * 1024) / (secs_dur + usecs_dur / 1000000.0);
+				write_rate = (double) BLCKSZ * total_blks_dirtied /
+					(1024 * 1024) / (secs_dur + usecs_dur / 1000000.0);
 			}
 			appendStringInfo(&buf, _("avg read rate: %.3f MB/s, avg write rate: %.3f MB/s\n"),
 							 read_rate, write_rate);
 			appendStringInfo(&buf,
-							 _("buffer usage: %lld hits, %lld misses, %lld dirtied\n"),
-							 (long long) PageHitOp,
-							 (long long) PageMissOp,
-							 (long long) PageDirtyOp);
+							 _("buffer usage: %lld hits, %lld reads, %lld dirtied\n"),
+							 (long long) total_blks_hit,
+							 (long long) total_blks_read,
+							 (long long) total_blks_dirtied);
 			appendStringInfo(&buf,
 							 _("WAL usage: %lld records, %lld full page images, %llu bytes\n"),
 							 (long long) walusage.wal_records,
@@ -2128,11 +2136,16 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 		Buffer		buf;
 		Page		page;
 		Size		freespace;
+		OffsetNumber offsets[MaxOffsetNumber];
+		int			num_offsets;
 
 		vacuum_delay_point();
 
 		blkno = iter_result->blkno;
 		vacrel->blkno = blkno;
+
+		num_offsets = TidStoreGetBlockOffsets(iter_result, offsets, lengthof(offsets));
+		Assert(num_offsets <= lengthof(offsets));
 
 		/*
 		 * Pin the visibility map page in case we need to mark the page
@@ -2145,8 +2158,8 @@ lazy_vacuum_heap_rel(LVRelState *vacrel)
 		buf = ReadBufferExtended(vacrel->rel, MAIN_FORKNUM, blkno, RBM_NORMAL,
 								 vacrel->bstrategy);
 		LockBuffer(buf, BUFFER_LOCK_EXCLUSIVE);
-		lazy_vacuum_heap_page(vacrel, blkno, buf, iter_result->offsets,
-							  iter_result->num_offsets, vmbuffer);
+		lazy_vacuum_heap_page(vacrel, blkno, buf, offsets,
+							  num_offsets, vmbuffer);
 
 		/* Now that we've vacuumed the page, record its available space */
 		page = BufferGetPage(buf);
@@ -2329,7 +2342,7 @@ lazy_check_wraparound_failsafe(LVRelState *vacrel)
 						vacrel->dbname, vacrel->relnamespace, vacrel->relname,
 						vacrel->num_index_scans),
 				 errdetail("The table's relfrozenxid or relminmxid is too far in the past."),
-				 errhint("Consider increasing configuration parameter maintenance_work_mem or autovacuum_work_mem.\n"
+				 errhint("Consider increasing configuration parameter \"maintenance_work_mem\" or \"autovacuum_work_mem\".\n"
 						 "You might also need to consider other ways for VACUUM to keep up with the allocation of transaction IDs.")));
 
 		/* Stop applying cost limits from this point on */
@@ -2885,13 +2898,19 @@ dead_items_add(LVRelState *vacrel, BlockNumber blkno, OffsetNumber *offsets,
 			   int num_offsets)
 {
 	TidStore   *dead_items = vacrel->dead_items;
+	const int	prog_index[2] = {
+		PROGRESS_VACUUM_NUM_DEAD_ITEM_IDS,
+		PROGRESS_VACUUM_DEAD_TUPLE_BYTES
+	};
+	int64		prog_val[2];
 
 	TidStoreSetBlockOffsets(dead_items, blkno, offsets, num_offsets);
 	vacrel->dead_items_info->num_items += num_offsets;
 
-	/* update the memory usage report */
-	pgstat_progress_update_param(PROGRESS_VACUUM_DEAD_TUPLE_BYTES,
-								 TidStoreMemoryUsage(dead_items));
+	/* update the progress information */
+	prog_val[0] = vacrel->dead_items_info->num_items;
+	prog_val[1] = TidStoreMemoryUsage(dead_items);
+	pgstat_progress_update_multi_param(2, prog_index, prog_val);
 }
 
 /*

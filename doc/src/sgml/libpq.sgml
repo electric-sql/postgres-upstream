@@ -262,41 +262,6 @@ PGconn *PQsetdb(char *pghost,
      </listitem>
     </varlistentry>
 
-    <varlistentry id="libpq-PQsocketPoll">
-     <term><function>PQsocketPoll</function><indexterm><primary>PQsocketPoll</primary></indexterm></term>
-     <listitem>
-      <para>
-       <indexterm><primary>nonblocking connection</primary></indexterm>
-       Poll a connection&apos;s underlying socket descriptor retrieved with <xref linkend="libpq-PQsocket"/>.
-<synopsis>
-int PQsocketPoll(int sock, int forRead, int forWrite, time_t end_time);
-</synopsis>
-      </para>
-
-      <para>
-       This function sets up polling of a file descriptor. The underlying function is either
-       <function>poll(2)</function> or <function>select(2)</function>, depending on platform
-       support. The primary use of this function is iterating through the connection sequence
-       described in the documentation of <xref linkend="libpq-PQconnectStartParams"/>. If
-       <parameter>forRead</parameter> is specified, the function waits for the socket to be ready
-       for reading. If <parameter>forWrite</parameter> is specified, the function waits for the
-       socket to be ready for write. See <literal>POLLIN</literal> and <literal>POLLOUT</literal>
-       from <function>poll(2)</function>, or <parameter>readfds</parameter> and
-       <parameter>writefds</parameter> from <function>select(2)</function> for more information. If
-       <parameter>end_time</parameter> is not <literal>-1</literal>, it specifies the time at which
-       this function should stop waiting for the condition to be met.
-      </para>
-
-      <para>
-       The function returns a value greater than <literal>0</literal> if the specified condition
-       is met, <literal>0</literal> if a timeout occurred, or <literal>-1</literal> if an error
-       occurred. The error can be retrieved by checking the <literal>errno(3)</literal> value. In
-       the event <literal>forRead</literal> and <literal>forWrite</literal> are not set, the
-       function immediately returns a timeout condition.
-      </para>
-     </listitem>
-    </varlistentry>
-
     <varlistentry id="libpq-PQconnectStartParams">
      <term><function>PQconnectStartParams</function><indexterm><primary>PQconnectStartParams</primary></indexterm></term>
      <term><function>PQconnectStart</function><indexterm><primary>PQconnectStart</primary></indexterm></term>
@@ -542,6 +507,70 @@ switch(PQstatus(conn))
        finished with it, in order to dispose of the structure and any
        associated memory blocks.  This must be done even if the connection
        attempt fails or is abandoned.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-PQsocketPoll">
+     <term><function>PQsocketPoll</function><indexterm><primary>PQsocketPoll</primary></indexterm></term>
+     <listitem>
+      <para>
+       <indexterm><primary>nonblocking connection</primary></indexterm>
+       Poll a connection's underlying socket descriptor retrieved with
+       <xref linkend="libpq-PQsocket"/>.
+       The primary use of this function is iterating through the connection
+       sequence described in the documentation of
+       <xref linkend="libpq-PQconnectStartParams"/>.
+<synopsis>
+typedef pg_int64 pg_usec_time_t;
+
+int PQsocketPoll(int sock, int forRead, int forWrite,
+                 pg_usec_time_t end_time);
+</synopsis>
+      </para>
+
+      <para>
+       This function performs polling of a file descriptor, optionally with
+       a timeout.
+       If <parameter>forRead</parameter> is nonzero, the
+       function will terminate when the socket is ready for
+       reading. If <parameter>forWrite</parameter> is nonzero,
+       the function will terminate when the
+       socket is ready for writing.
+      </para>
+
+      <para>
+       The timeout is specified by <parameter>end_time</parameter>, which
+       is the time to stop waiting expressed as a number of microseconds since
+       the Unix epoch (that is, <type>time_t</type> times 1 million).
+       Timeout is infinite if <parameter>end_time</parameter>
+       is <literal>-1</literal>.  Timeout is immediate (no blocking) if
+       end_time is <literal>0</literal> (or indeed, any time before now).
+       Timeout values can be calculated conveniently by adding the desired
+       number of microseconds to the result of
+       <xref linkend="libpq-PQgetCurrentTimeUSec"/>.
+       Note that the underlying system calls may have less than microsecond
+       precision, so that the actual delay may be imprecise.
+      </para>
+
+      <para>
+       The function returns a value greater than <literal>0</literal> if the
+       specified condition is met, <literal>0</literal> if a timeout occurred,
+       or <literal>-1</literal> if an error occurred. The error can be
+       retrieved by checking the <literal>errno(3)</literal> value. In the
+       event both <parameter>forRead</parameter>
+       and <parameter>forWrite</parameter> are zero, the function immediately
+       returns a timeout indication.
+      </para>
+
+      <para>
+       <function>PQsocketPoll</function> is implemented using either
+       <function>poll(2)</function> or <function>select(2)</function>,
+       depending on platform.  See <literal>POLLIN</literal>
+       and <literal>POLLOUT</literal> from <function>poll(2)</function>,
+       or <parameter>readfds</parameter> and
+       <parameter>writefds</parameter> from <function>select(2)</function>,
+       for more information.
       </para>
      </listitem>
     </varlistentry>
@@ -1390,8 +1419,7 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
       <para>
        Maximum time to wait while connecting, in seconds (write as a decimal integer,
        e.g., <literal>10</literal>).  Zero, negative, or not specified means
-       wait indefinitely.  The minimum allowed timeout is 2 seconds, therefore
-       a value of <literal>1</literal> is interpreted as <literal>2</literal>.
+       wait indefinitely.
        This timeout applies separately to each host name or IP address.
        For example, if you specify two hosts and <literal>connect_timeout</literal>
        is 5, each host will time out if no connection is made within 5
@@ -1421,9 +1449,10 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
       <listitem>
        <para>
         Specifies command-line options to send to the server at connection
-        start.  For example, setting this to <literal>-c geqo=off</literal> sets the
-        session's value of the <varname>geqo</varname> parameter to
-        <literal>off</literal>.  Spaces within this string are considered to
+        start.  For example, setting this to <literal>-c geqo=off</literal>
+        or <literal>--geqo=off</literal> sets the session's value of the
+        <varname>geqo</varname> parameter to <literal>off</literal>.
+        Spaces within this string are considered to
         separate command-line arguments, unless escaped with a backslash
         (<literal>\</literal>); write <literal>\\</literal> to represent a literal
         backslash.  For a detailed discussion of the available
@@ -1772,15 +1801,18 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
       <term><literal>sslnegotiation</literal></term>
       <listitem>
        <para>
-        This option controls whether <productname>PostgreSQL</productname>
-        will perform its protocol negotiation to request encryption from the
-        server or will just directly make a standard <acronym>SSL</acronym>
-        connection.  Traditional <productname>PostgreSQL</productname>
-        protocol negotiation is the default and the most flexible with
-        different server configurations. If the server is known to support
-        direct <acronym>SSL</acronym> connections then the latter requires one
-        fewer round trip reducing connection latency and also allows the use
-        of protocol agnostic SSL network tools.
+        This option controls how SSL encryption is negotiated with the server,
+        if SSL is used. In the default <literal>postgres</literal> mode, the
+        client first asks the server if SSL is supported. In
+        <literal>direct</literal> mode, the client starts the standard SSL
+        handshake directly after establishing the TCP/IP connection. Traditional
+        <productname>PostgreSQL</productname> protocol negotiation is the most
+        flexible with different server configurations. If the server is known
+        to support direct <acronym>SSL</acronym> connections then the latter
+        requires one fewer round trip reducing connection latency and also
+        allows the use of protocol agnostic SSL network tools. The direct SSL
+        option was introduced in <productname>PostgreSQL</productname> version
+        17.
        </para>
 
         <variablelist>
@@ -1798,34 +1830,15 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
           <term><literal>direct</literal></term>
           <listitem>
            <para>
-             first attempt to establish a standard SSL connection and if that
-             fails reconnect and perform the negotiation. This fallback
-             process adds significant latency if the initial SSL connection
-             fails.
-           </para>
-          </listitem>
-         </varlistentry>
-
-         <varlistentry>
-          <term><literal>requiredirect</literal></term>
-          <listitem>
-           <para>
-             attempt to establish a standard SSL connection and if that fails
-             return a connection failure immediately.
+             start SSL handshake directly after establishing the TCP/IP
+             connection.  This is only allowed with sslmode=require or higher,
+             because the weaker settings could lead to unintended fallback to
+             plaintext authentication when the server does not support direct
+             SSL handshake.
            </para>
           </listitem>
          </varlistentry>
         </variablelist>
-
-       <para>
-        Note that if <literal>gssencmode</literal> is set
-        to <literal>prefer</literal>, a <acronym>GSS</acronym> connection is
-        attempted first. If the server rejects GSS encryption, SSL is
-        negotiated over the same TCP connection using the traditional postgres
-        protocol, regardless of <literal>sslnegotiation</literal>. In other
-        words, the direct SSL handshake is not used, if a TCP connection has
-        already been established and can be used for the SSL handshake.
-       </para>
       </listitem>
      </varlistentry>
 
@@ -1840,11 +1853,11 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
 
        <para>
         SSL compression is nowadays considered insecure and its use is no
-        longer recommended.  <productname>OpenSSL</productname> 1.1.0 disables
+        longer recommended.  <productname>OpenSSL</productname> 1.1.0 disabled
         compression by default, and many operating system distributions
-        disable it in prior versions as well, so setting this parameter to on
+        disabled it in prior versions as well, so setting this parameter to on
         will not have any effect if the server does not accept compression.
-        <productname>PostgreSQL</productname> 14 disables compression
+        <productname>PostgreSQL</productname> 14 disabled compression
         completely in the backend.
        </para>
 
@@ -2065,7 +2078,7 @@ postgresql://%2Fvar%2Flib%2Fpostgresql/dbname
         connections without having to decrypt the SSL stream.  (Note that
         unless the proxy is aware of the PostgreSQL protocol handshake this
         would require setting <literal>sslnegotiation</literal>
-        to <literal>direct</literal> or <literal>requiredirect</literal>.)
+        to <literal>direct</literal>.)
         However, <acronym>SNI</acronym> makes the destination host name appear
         in cleartext in the network traffic, so it might be undesirable in
         some cases.
@@ -2630,6 +2643,7 @@ const char *PQparameterStatus(const PGconn *conn, const char *paramName);
         <member><varname>IntervalStyle</varname></member>
         <member><varname>is_superuser</varname></member>
         <member><varname>scram_iterations</varname></member>
+        <member><varname>search_path</varname></member>
         <member><varname>server_encoding</varname></member>
         <member><varname>server_version</varname></member>
         <member><varname>session_authorization</varname></member>
@@ -2639,7 +2653,8 @@ const char *PQparameterStatus(const PGconn *conn, const char *paramName);
        (<varname>default_transaction_read_only</varname> and
        <varname>in_hot_standby</varname> were not reported by releases before
        14; <varname>scram_iterations</varname> was not reported by releases
-       before 16.)
+       before 16; <varname>search_path</varname> was not reported by releases
+       before 18.)
        Note that
        <varname>server_version</varname>,
        <varname>server_encoding</varname> and
@@ -2663,22 +2678,44 @@ const char *PQparameterStatus(const PGconn *conn, const char *paramName);
      </listitem>
     </varlistentry>
 
-    <varlistentry id="libpq-PQprotocolVersion">
-     <term><function>PQprotocolVersion</function><indexterm><primary>PQprotocolVersion</primary></indexterm></term>
+    <varlistentry id="libpq-PQfullProtocolVersion">
+     <term><function>PQfullProtocolVersion</function><indexterm><primary>PQfullProtocolVersion</primary></indexterm></term>
 
      <listitem>
       <para>
        Interrogates the frontend/backend protocol being used.
 <synopsis>
-int PQprotocolVersion(const PGconn *conn);
+int PQfullProtocolVersion(const PGconn *conn);
 </synopsis>
        Applications might wish to use this function to determine whether certain
-       features are supported.  Currently, the possible values are 3
-       (3.0 protocol), or zero (connection bad).  The protocol version will
-       not change after connection startup is complete, but it could
-       theoretically change during a connection reset.  The 3.0 protocol is
-       supported by <productname>PostgreSQL</productname> server versions 7.4
-       and above.
+       features are supported. The result is formed by multiplying the server's
+       major version number by 10000 and adding the minor version number. For
+       example, version 3.2 would be returned as 30002, and version 4.0 would
+       be returned as 40000. Zero is returned if the connection is bad. The 3.0
+       protocol is supported by <productname>PostgreSQL</productname> server
+       versions 7.4 and above.
+      </para>
+      <para>
+       The protocol version will not change after connection startup is
+       complete, but it could theoretically change during a connection reset.
+      </para>
+     </listitem>
+    </varlistentry>
+
+    <varlistentry id="libpq-PQprotocolVersion">
+     <term><function>PQprotocolVersion</function><indexterm><primary>PQprotocolVersion</primary></indexterm></term>
+
+     <listitem>
+      <para>
+       Interrogates the frontend/backend protocol major version.
+<synopsis>
+int PQprotocolVersion(const PGconn *conn);
+</synopsis>
+       Unlike <xref linkend="libpq-PQfullProtocolVersion"/>, this returns only
+       the major protocol version in use, but it is supported by a wider range
+       of libpq releases back to version 7.4. Currently, the possible values are
+       3 (3.0 protocol), or zero (connection bad). Prior to release version
+       14.0, libpq could additionally return 2 (2.0 protocol).
       </para>
      </listitem>
     </varlistentry>
@@ -2950,7 +2987,7 @@ const char *PQsslAttribute(const PGconn *conn, const char *attribute_name);
            <para>
             Application protocol selected by the TLS Application-Layer
             Protocol Negotiation (ALPN) extension.  The only protocol
-            supported by libpq is <literal>TBD-pgsql</literal>, so this is
+            supported by libpq is <literal>postgresql</literal>, so this is
             mainly useful for checking whether the server supported ALPN or
             not. Empty string if ALPN was not used.
            </para>
@@ -6518,7 +6555,7 @@ int PQcancelSocket(const PGcancelConn *cancelConn);
        A valid descriptor will be greater than or equal to 0;
        a result of -1 indicates that no server connection is currently open.
        This might change as a result of calling any of the functions
-       in this section on the <structname>PQcancelConn</structname>
+       in this section on the <structname>PGcancelConn</structname>
        (except for <xref linkend="libpq-PQcancelErrorMessage"/> and
        <function>PQcancelSocket</function> itself).
       </para>
@@ -8051,6 +8088,25 @@ int PQlibVersion(void);
        on version 9.1 or later.
       </para>
      </note>
+    </listitem>
+   </varlistentry>
+
+   <varlistentry id="libpq-PQgetCurrentTimeUSec">
+    <term><function>PQgetCurrentTimeUSec</function><indexterm><primary>PQgetCurrentTimeUSec</primary></indexterm></term>
+
+    <listitem>
+     <para>
+      Retrieves the current time, expressed as the number of microseconds
+      since the Unix epoch (that is, <type>time_t</type> times 1 million).
+<synopsis>
+pg_usec_time_t PQgetCurrentTimeUSec(void);
+</synopsis>
+     </para>
+
+     <para>
+      This is primarily useful for calculating timeout values to use with
+      <xref linkend="libpq-PQsocketPoll"/>.
+     </para>
     </listitem>
    </varlistentry>
 
@@ -9831,15 +9887,21 @@ ldap://ldap.acme.com/cn=dbserver,cn=hosts?pgconnectinfo?base?(objectclass=*)
   <title>SSL Library Initialization</title>
 
   <para>
-   If your application initializes <literal>libssl</literal> and/or
-   <literal>libcrypto</literal> libraries and <application>libpq</application>
-   is built with <acronym>SSL</acronym> support, you should call
+   Applications which need to be compatible with older versions of
+   <productname>PostgreSQL</productname>, using <productname>OpenSSL</productname>
+   version 1.0.2 or older, need to initialize the SSL library before using it.
+   Applications which initialize <literal>libssl</literal> and/or
+   <literal>libcrypto</literal> libraries should call
    <xref linkend="libpq-PQinitOpenSSL"/> to tell <application>libpq</application>
    that the <literal>libssl</literal> and/or <literal>libcrypto</literal> libraries
    have been initialized by your application, so that
    <application>libpq</application> will not also initialize those libraries.
    However, this is unnecessary when using <productname>OpenSSL</productname>
    version 1.1.0 or later, as duplicate initializations are no longer problematic.
+  </para>
+  <para>
+   Refer to the documentation for the version of <productname>PostgreSQL</productname>
+   that you are targeting for details on their use.
   </para>
 
   <para>
@@ -9856,21 +9918,8 @@ void PQinitOpenSSL(int do_ssl, int do_crypto);
       </para>
 
       <para>
-       When <parameter>do_ssl</parameter> is non-zero, <application>libpq</application>
-       will initialize the <productname>OpenSSL</productname> library before first
-       opening a database connection.  When <parameter>do_crypto</parameter> is
-       non-zero, the <literal>libcrypto</literal> library will be initialized.  By
-       default (if <xref linkend="libpq-PQinitOpenSSL"/> is not called), both libraries
-       are initialized.  When SSL support is not compiled in, this function is
-       present but does nothing.
-      </para>
-
-      <para>
-       If your application uses and initializes either <productname>OpenSSL</productname>
-       or its underlying <literal>libcrypto</literal> library, you <emphasis>must</emphasis>
-       call this function with zeroes for the appropriate parameter(s)
-       before first opening a database connection.  Also be sure that you
-       have done that initialization before opening a database connection.
+       This function is deprecated and only present for backwards compatibility,
+       it does nothing.
       </para>
      </listitem>
     </varlistentry>
@@ -9887,11 +9936,14 @@ void PQinitSSL(int do_ssl);
       <para>
        This function is equivalent to
        <literal>PQinitOpenSSL(do_ssl, do_ssl)</literal>.
-       It is sufficient for applications that initialize both or neither
-       of <productname>OpenSSL</productname> and <literal>libcrypto</literal>.
+       This function is deprecated and only present for backwards compatibility,
+       it does nothing.
       </para>
 
       <para>
+       <xref linkend="libpq-PQinitSSL"/> and <xref linkend="libpq-PQinitOpenSSL"/>
+       are maintained for backwards compatibility, but are no longer required
+       since <productname>PostgreSQL</productname> 18.
        <xref linkend="libpq-PQinitSSL"/> has been present since
        <productname>PostgreSQL</productname> 8.0, while <xref linkend="libpq-PQinitOpenSSL"/>
        was added in <productname>PostgreSQL</productname> 8.4, so <xref linkend="libpq-PQinitSSL"/>

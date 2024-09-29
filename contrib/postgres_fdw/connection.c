@@ -12,6 +12,10 @@
  */
 #include "postgres.h"
 
+#if HAVE_POLL_H
+#include <poll.h>
+#endif
+
 #include "access/htup_details.h"
 #include "access/xact.h"
 #include "catalog/pg_user_mapping.h"
@@ -108,9 +112,19 @@ static uint32 pgfdw_we_get_result = 0;
 	} while(0)
 
 /*
+ * Extension version number, for supporting older extension versions' objects
+ */
+enum pgfdwVersion
+{
+	PGFDW_V1_1 = 0,
+	PGFDW_V1_2,
+};
+
+/*
  * SQL functions
  */
 PG_FUNCTION_INFO_V1(postgres_fdw_get_connections);
+PG_FUNCTION_INFO_V1(postgres_fdw_get_connections_1_2);
 PG_FUNCTION_INFO_V1(postgres_fdw_disconnect);
 PG_FUNCTION_INFO_V1(postgres_fdw_disconnect_all);
 
@@ -159,6 +173,10 @@ static void pgfdw_security_check(const char **keywords, const char **values,
 								 UserMapping *user, PGconn *conn);
 static bool UserMappingPasswordRequired(UserMapping *user);
 static bool disconnect_cached_connections(Oid serverid);
+static void postgres_fdw_get_connections_internal(FunctionCallInfo fcinfo,
+												  enum pgfdwVersion api_version);
+static int	pgfdw_conn_check(PGconn *conn);
+static bool pgfdw_conn_checkable(void);
 
 /*
  * Get a PGconn which can be used to execute queries on the remote PostgreSQL
@@ -671,10 +689,12 @@ configure_remote_session(PGconn *conn)
 	 * anyway.  However it makes the regression test outputs more predictable.
 	 *
 	 * We don't risk setting remote zone equal to ours, since the remote
-	 * server might use a different timezone database.  Instead, use UTC
-	 * (quoted, because very old servers are picky about case).
+	 * server might use a different timezone database.  Instead, use GMT
+	 * (quoted, because very old servers are picky about case).  That's
+	 * guaranteed to work regardless of the remote's timezone database,
+	 * because pg_tzset() hard-wires it (at least in PG 9.2 and later).
 	 */
-	do_sql_command(conn, "SET timezone = 'UTC'");
+	do_sql_command(conn, "SET timezone = 'GMT'");
 
 	/*
 	 * Set values needed to ensure unambiguous data output from remote.  (This
@@ -1975,23 +1995,39 @@ pgfdw_finish_abort_cleanup(List *pending_entries, List *cancel_requested,
 	}
 }
 
+/* Number of output arguments (columns) for various API versions */
+#define POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_1	2
+#define POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_2	5
+#define POSTGRES_FDW_GET_CONNECTIONS_COLS	5	/* maximum of above */
+
 /*
- * List active foreign server connections.
+ * Internal function used by postgres_fdw_get_connections variants.
  *
- * This function takes no input parameter and returns setof record made of
- * following values:
+ * For API version 1.1, this function takes no input parameter and
+ * returns a set of records with the following values:
+ *
  * - server_name - server name of active connection. In case the foreign server
  *   is dropped but still the connection is active, then the server name will
  *   be NULL in output.
  * - valid - true/false representing whether the connection is valid or not.
- * 	 Note that the connections can get invalidated in pgfdw_inval_callback.
+ *   Note that connections can become invalid in pgfdw_inval_callback.
+ *
+ * For API version 1.2 and later, this function takes an input parameter
+ * to check a connection status and returns the following
+ * additional values along with the three values from version 1.1:
+ *
+ * - user_name - the local user name of the active connection. In case the
+ *   user mapping is dropped but the connection is still active, then the
+ *   user name will be NULL in the output.
+ * - used_in_xact - true if the connection is used in the current transaction.
+ * - closed - true if the connection is closed.
  *
  * No records are returned when there are no cached connections at all.
  */
-Datum
-postgres_fdw_get_connections(PG_FUNCTION_ARGS)
+static void
+postgres_fdw_get_connections_internal(FunctionCallInfo fcinfo,
+									  enum pgfdwVersion api_version)
 {
-#define POSTGRES_FDW_GET_CONNECTIONS_COLS	2
 	ReturnSetInfo *rsinfo = (ReturnSetInfo *) fcinfo->resultinfo;
 	HASH_SEQ_STATUS scan;
 	ConnCacheEntry *entry;
@@ -2000,7 +2036,22 @@ postgres_fdw_get_connections(PG_FUNCTION_ARGS)
 
 	/* If cache doesn't exist, we return no records */
 	if (!ConnectionHash)
-		PG_RETURN_VOID();
+		return;
+
+	/* Check we have the expected number of output arguments */
+	switch (rsinfo->setDesc->natts)
+	{
+		case POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_1:
+			if (api_version != PGFDW_V1_1)
+				elog(ERROR, "incorrect number of output arguments");
+			break;
+		case POSTGRES_FDW_GET_CONNECTIONS_COLS_V1_2:
+			if (api_version != PGFDW_V1_2)
+				elog(ERROR, "incorrect number of output arguments");
+			break;
+		default:
+			elog(ERROR, "incorrect number of output arguments");
+	}
 
 	hash_seq_init(&scan, ConnectionHash);
 	while ((entry = (ConnCacheEntry *) hash_seq_search(&scan)))
@@ -2008,6 +2059,7 @@ postgres_fdw_get_connections(PG_FUNCTION_ARGS)
 		ForeignServer *server;
 		Datum		values[POSTGRES_FDW_GET_CONNECTIONS_COLS] = {0};
 		bool		nulls[POSTGRES_FDW_GET_CONNECTIONS_COLS] = {0};
+		int			i = 0;
 
 		/* We only look for open remote connections */
 		if (!entry->conn)
@@ -2052,15 +2104,87 @@ postgres_fdw_get_connections(PG_FUNCTION_ARGS)
 			Assert(entry->conn && entry->xact_depth > 0 && entry->invalidated);
 
 			/* Show null, if no server name was found */
-			nulls[0] = true;
+			nulls[i++] = true;
 		}
 		else
-			values[0] = CStringGetTextDatum(server->servername);
+			values[i++] = CStringGetTextDatum(server->servername);
 
-		values[1] = BoolGetDatum(!entry->invalidated);
+		if (api_version >= PGFDW_V1_2)
+		{
+			HeapTuple	tp;
+
+			/* Use the system cache to obtain the user mapping */
+			tp = SearchSysCache1(USERMAPPINGOID, ObjectIdGetDatum(entry->key));
+
+			/*
+			 * Just like in the foreign server case, user mappings can also be
+			 * dropped in the current explicit transaction. Therefore, the
+			 * similar check as in the server case is required.
+			 */
+			if (!HeapTupleIsValid(tp))
+			{
+				/*
+				 * If we reach here, this entry must have been invalidated in
+				 * pgfdw_inval_callback, same as in the server case.
+				 */
+				Assert(entry->conn && entry->xact_depth > 0 &&
+					   entry->invalidated);
+
+				nulls[i++] = true;
+			}
+			else
+			{
+				Oid			userid;
+
+				userid = ((Form_pg_user_mapping) GETSTRUCT(tp))->umuser;
+				values[i++] = CStringGetTextDatum(MappingUserName(userid));
+				ReleaseSysCache(tp);
+			}
+		}
+
+		values[i++] = BoolGetDatum(!entry->invalidated);
+
+		if (api_version >= PGFDW_V1_2)
+		{
+			bool		check_conn = PG_GETARG_BOOL(0);
+
+			/* Is this connection used in the current transaction? */
+			values[i++] = BoolGetDatum(entry->xact_depth > 0);
+
+			/*
+			 * If a connection status check is requested and supported, return
+			 * whether the connection is closed. Otherwise, return NULL.
+			 */
+			if (check_conn && pgfdw_conn_checkable())
+				values[i++] = BoolGetDatum(pgfdw_conn_check(entry->conn) != 0);
+			else
+				nulls[i++] = true;
+		}
 
 		tuplestore_putvalues(rsinfo->setResult, rsinfo->setDesc, values, nulls);
 	}
+}
+
+/*
+ * List active foreign server connections.
+ *
+ * The SQL API of this function has changed multiple times, and will likely
+ * do so again in future.  To support the case where a newer version of this
+ * loadable module is being used with an old SQL declaration of the function,
+ * we continue to support the older API versions.
+ */
+Datum
+postgres_fdw_get_connections_1_2(PG_FUNCTION_ARGS)
+{
+	postgres_fdw_get_connections_internal(fcinfo, PGFDW_V1_2);
+
+	PG_RETURN_VOID();
+}
+
+Datum
+postgres_fdw_get_connections(PG_FUNCTION_ARGS)
+{
+	postgres_fdw_get_connections_internal(fcinfo, PGFDW_V1_1);
 
 	PG_RETURN_VOID();
 }
@@ -2189,4 +2313,58 @@ disconnect_cached_connections(Oid serverid)
 	}
 
 	return result;
+}
+
+/*
+ * Check if the remote server closed the connection.
+ *
+ * Returns 1 if the connection is closed, -1 if an error occurred,
+ * and 0 if it's not closed or if the connection check is unavailable
+ * on this platform.
+ */
+static int
+pgfdw_conn_check(PGconn *conn)
+{
+	int			sock = PQsocket(conn);
+
+	if (PQstatus(conn) != CONNECTION_OK || sock == -1)
+		return -1;
+
+#if (defined(HAVE_POLL) && defined(POLLRDHUP))
+	{
+		struct pollfd input_fd;
+		int			result;
+
+		input_fd.fd = sock;
+		input_fd.events = POLLRDHUP;
+		input_fd.revents = 0;
+
+		do
+			result = poll(&input_fd, 1, 0);
+		while (result < 0 && errno == EINTR);
+
+		if (result < 0)
+			return -1;
+
+		return (input_fd.revents &
+				(POLLRDHUP | POLLHUP | POLLERR | POLLNVAL)) ? 1 : 0;
+	}
+#else
+	return 0;
+#endif
+}
+
+/*
+ * Check if connection status checking is available on this platform.
+ *
+ * Returns true if available, false otherwise.
+ */
+static bool
+pgfdw_conn_checkable(void)
+{
+#if (defined(HAVE_POLL) && defined(POLLRDHUP))
+	return true;
+#else
+	return false;
+#endif
 }

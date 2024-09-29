@@ -269,7 +269,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	PartitionElem *partelem;
 	PartitionSpec *partspec;
 	PartitionBoundSpec *partboundspec;
-	SinglePartitionSpec *singlepartspec;
 	RoleSpec   *rolespec;
 	PublicationObjSpec *publicationobjectspec;
 	struct SelectLimit *selectlimit;
@@ -495,7 +494,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 
 %type <boolean> opt_instead
 %type <boolean> opt_unique opt_verbose opt_full
-%type <boolean> opt_freeze opt_analyze opt_default opt_recheck
+%type <boolean> opt_freeze opt_analyze opt_default
 %type <defelt>	opt_binary copy_delimiter
 
 %type <boolean> copy_from opt_program
@@ -647,8 +646,6 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 %type <partelem>	part_elem
 %type <list>		part_params
 %type <partboundspec> PartitionBoundSpec
-%type <singlepartspec>	SinglePartitionSpec
-%type <list>		partitions_list
 %type <list>		hash_partbound
 %type <defelt>		hash_partbound_elem
 
@@ -764,15 +761,14 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	ORDER ORDINALITY OTHERS OUT_P OUTER_P
 	OVER OVERLAPS OVERLAY OVERRIDING OWNED OWNER
 
-	PARALLEL PARAMETER PARSER PARTIAL PARTITION PARTITIONS PASSING PASSWORD PATH
+	PARALLEL PARAMETER PARSER PARTIAL PARTITION PASSING PASSWORD PATH
 	PERIOD PLACING PLAN PLANS POLICY
-
 	POSITION PRECEDING PRECISION PRESERVE PREPARE PREPARED PRIMARY
 	PRIOR PRIVILEGES PROCEDURAL PROCEDURE PROCEDURES PROGRAM PUBLICATION
 
 	QUOTE QUOTES
 
-	RANGE READ REAL REASSIGN RECHECK RECURSIVE REF_P REFERENCES REFERENCING
+	RANGE READ REAL REASSIGN RECURSIVE REF_P REFERENCES REFERENCING
 	REFRESH REINDEX RELATIVE_P RELEASE RENAME REPEATABLE REPLACE REPLICA
 	RESET RESTART RESTRICT RETURN RETURNING RETURNS REVOKE RIGHT ROLE ROLLBACK ROLLUP
 	ROUTINE ROUTINES ROW ROWS RULE
@@ -780,7 +776,7 @@ static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
 	SAVEPOINT SCALAR SCHEMA SCHEMAS SCROLL SEARCH SECOND_P SECURITY SELECT
 	SEQUENCE SEQUENCES
 	SERIALIZABLE SERVER SESSION SESSION_USER SET SETS SETOF SHARE SHOW
-	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SPLIT SOURCE SQL_P STABLE STANDALONE_P
+	SIMILAR SIMPLE SKIP SMALLINT SNAPSHOT SOME SOURCE SQL_P STABLE STANDALONE_P
 	START STATEMENT STATISTICS STDIN STDOUT STORAGE STORED STRICT_P STRING_P STRIP_P
 	SUBSCRIPTION SUBSTRING SUPPORT SYMMETRIC SYSID SYSTEM_P SYSTEM_USER
 
@@ -2313,23 +2309,6 @@ alter_table_cmds:
 			| alter_table_cmds ',' alter_table_cmd	{ $$ = lappend($1, $3); }
 		;
 
-partitions_list:
-			SinglePartitionSpec							{ $$ = list_make1($1); }
-			| partitions_list ',' SinglePartitionSpec	{ $$ = lappend($1, $3); }
-		;
-
-SinglePartitionSpec:
-			PARTITION qualified_name PartitionBoundSpec
-				{
-					SinglePartitionSpec *n = makeNode(SinglePartitionSpec);
-
-					n->name = $2;
-					n->bound = $3;
-
-					$$ = n;
-				}
-		;
-
 partition_cmd:
 			/* ALTER TABLE <name> ATTACH PARTITION <table_name> FOR VALUES */
 			ATTACH PARTITION qualified_name PartitionBoundSpec
@@ -2340,7 +2319,6 @@ partition_cmd:
 					n->subtype = AT_AttachPartition;
 					cmd->name = $3;
 					cmd->bound = $4;
-					cmd->partlist = NULL;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 
@@ -2355,7 +2333,6 @@ partition_cmd:
 					n->subtype = AT_DetachPartition;
 					cmd->name = $3;
 					cmd->bound = NULL;
-					cmd->partlist = NULL;
 					cmd->concurrent = $4;
 					n->def = (Node *) cmd;
 
@@ -2369,35 +2346,6 @@ partition_cmd:
 					n->subtype = AT_DetachPartitionFinalize;
 					cmd->name = $3;
 					cmd->bound = NULL;
-					cmd->partlist = NULL;
-					cmd->concurrent = false;
-					n->def = (Node *) cmd;
-					$$ = (Node *) n;
-				}
-			/* ALTER TABLE <name> SPLIT PARTITION <partition_name> INTO () */
-			| SPLIT PARTITION qualified_name INTO '(' partitions_list ')'
-				{
-					AlterTableCmd *n = makeNode(AlterTableCmd);
-					PartitionCmd *cmd = makeNode(PartitionCmd);
-
-					n->subtype = AT_SplitPartition;
-					cmd->name = $3;
-					cmd->bound = NULL;
-					cmd->partlist = $6;
-					cmd->concurrent = false;
-					n->def = (Node *) cmd;
-					$$ = (Node *) n;
-				}
-			/* ALTER TABLE <name> MERGE PARTITIONS () INTO <partition_name> */
-			| MERGE PARTITIONS '(' qualified_name_list ')' INTO qualified_name
-				{
-					AlterTableCmd *n = makeNode(AlterTableCmd);
-					PartitionCmd *cmd = makeNode(PartitionCmd);
-
-					n->subtype = AT_MergePartitions;
-					cmd->name = $7;
-					cmd->bound = NULL;
-					cmd->partlist = $4;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 					$$ = (Node *) n;
@@ -2414,7 +2362,6 @@ index_partition_cmd:
 					n->subtype = AT_AttachPartition;
 					cmd->name = $3;
 					cmd->bound = NULL;
-					cmd->partlist = NULL;
 					cmd->concurrent = false;
 					n->def = (Node *) cmd;
 
@@ -3953,15 +3900,12 @@ ColConstraint:
  * or be part of a_expr NOT LIKE or similar constructs).
  */
 ColConstraintElem:
-			NOT NULL_P opt_no_inherit
+			NOT NULL_P
 				{
 					Constraint *n = makeNode(Constraint);
 
 					n->contype = CONSTR_NOTNULL;
 					n->location = @1;
-					n->is_no_inherit = $3;
-					n->skip_validation = false;
-					n->initially_valid = true;
 					$$ = (Node *) n;
 				}
 			| NULL_P
@@ -4196,20 +4140,6 @@ ConstraintElem:
 								   NULL, NULL, &n->skip_validation,
 								   &n->is_no_inherit, yyscanner);
 					n->initially_valid = !n->skip_validation;
-					$$ = (Node *) n;
-				}
-			| NOT NULL_P ColId ConstraintAttributeSpec
-				{
-					Constraint *n = makeNode(Constraint);
-
-					n->contype = CONSTR_NOTNULL;
-					n->location = @1;
-					n->keys = list_make1(makeString($3));
-					/* no NOT VALID support yet */
-					processCASbits($4, @4, "NOT NULL",
-								   NULL, NULL, NULL,
-								   &n->is_no_inherit, yyscanner);
-					n->initially_valid = true;
 					$$ = (Node *) n;
 				}
 			| UNIQUE opt_unique_null_treatment '(' columnList opt_without_overlaps ')' opt_c_include opt_definition OptConsTableSpace
@@ -5006,6 +4936,10 @@ SeqOptElem: AS SimpleTypename
 				{
 					$$ = makeDefElem("increment", (Node *) $3, @1);
 				}
+			| LOGGED
+				{
+					$$ = makeDefElem("logged", NULL, @1);
+				}
 			| MAXVALUE NumericOnly
 				{
 					$$ = makeDefElem("maxvalue", (Node *) $2, @1);
@@ -5028,7 +4962,6 @@ SeqOptElem: AS SimpleTypename
 				}
 			| SEQUENCE NAME_P any_name
 				{
-					/* not documented, only used by pg_dump */
 					$$ = makeDefElem("sequence_name", (Node *) $3, @1);
 				}
 			| START opt_with NumericOnly
@@ -5042,6 +4975,10 @@ SeqOptElem: AS SimpleTypename
 			| RESTART opt_with NumericOnly
 				{
 					$$ = makeDefElem("restart", (Node *) $3, @1);
+				}
+			| UNLOGGED
+				{
+					$$ = makeDefElem("unlogged", NULL, @1);
 				}
 		;
 
@@ -6668,7 +6605,7 @@ opclass_item_list:
 		;
 
 opclass_item:
-			OPERATOR Iconst any_operator opclass_purpose opt_recheck
+			OPERATOR Iconst any_operator opclass_purpose
 				{
 					CreateOpClassItem *n = makeNode(CreateOpClassItem);
 					ObjectWithArgs *owa = makeNode(ObjectWithArgs);
@@ -6682,7 +6619,6 @@ opclass_item:
 					$$ = (Node *) n;
 				}
 			| OPERATOR Iconst operator_with_argtypes opclass_purpose
-			  opt_recheck
 				{
 					CreateOpClassItem *n = makeNode(CreateOpClassItem);
 
@@ -6732,23 +6668,6 @@ opt_opfamily:	FAMILY any_name				{ $$ = $2; }
 opclass_purpose: FOR SEARCH					{ $$ = NIL; }
 			| FOR ORDER BY any_name			{ $$ = $4; }
 			| /*EMPTY*/						{ $$ = NIL; }
-		;
-
-opt_recheck:	RECHECK
-				{
-					/*
-					 * RECHECK no longer does anything in opclass definitions,
-					 * but we still accept it to ease porting of old database
-					 * dumps.
-					 */
-					ereport(NOTICE,
-							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("RECHECK is no longer required"),
-							 errhint("Update your data type."),
-							 parser_errposition(@1)));
-					$$ = true;
-				}
-			| /*EMPTY*/						{ $$ = false; }
 		;
 
 
@@ -12002,7 +11921,7 @@ opt_name_list:
 		;
 
 vacuum_relation:
-			qualified_name opt_name_list
+			relation_expr opt_name_list
 				{
 					$$ = (Node *) makeVacuumRelation($1, InvalidOid, $2);
 				}
@@ -14311,7 +14230,7 @@ json_table_column_definition:
 				}
 			| ColId Typename
 				EXISTS json_table_column_path_clause_opt
-				json_behavior_clause_opt
+				json_on_error_clause_opt
 				{
 					JsonTableColumn *n = makeNode(JsonTableColumn);
 
@@ -14322,8 +14241,8 @@ json_table_column_definition:
 					n->wrapper = JSW_NONE;
 					n->quotes = JS_QUOTES_UNSPEC;
 					n->pathspec = (JsonTablePathSpec *) $4;
-					n->on_empty = (JsonBehavior *) linitial($5);
-					n->on_error = (JsonBehavior *) lsecond($5);
+					n->on_empty = NULL;
+					n->on_error = (JsonBehavior *) $5;
 					n->location = @1;
 					$$ = (Node *) n;
 				}
@@ -15713,7 +15632,7 @@ func_expr: func_application within_group_clause filter_clause over_clause
 		;
 
 /*
- * As func_expr but does not accept WINDOW functions directly
+ * Like func_expr but does not accept WINDOW functions directly
  * (but they can still be contained in arguments for functions etc).
  * Use this when window expressions are not allowed, where needed to
  * disambiguate the grammar (e.g. in CREATE INDEX).
@@ -17807,7 +17726,6 @@ unreserved_keyword:
 			| PARSER
 			| PARTIAL
 			| PARTITION
-			| PARTITIONS
 			| PASSING
 			| PASSWORD
 			| PATH
@@ -17831,7 +17749,6 @@ unreserved_keyword:
 			| RANGE
 			| READ
 			| REASSIGN
-			| RECHECK
 			| RECURSIVE
 			| REF_P
 			| REFERENCING
@@ -17877,7 +17794,6 @@ unreserved_keyword:
 			| SKIP
 			| SNAPSHOT
 			| SOURCE
-			| SPLIT
 			| SQL_P
 			| STABLE
 			| STANDALONE_P
@@ -18434,7 +18350,6 @@ bare_label_keyword:
 			| PARSER
 			| PARTIAL
 			| PARTITION
-			| PARTITIONS
 			| PASSING
 			| PASSWORD
 			| PATH
@@ -18462,7 +18377,6 @@ bare_label_keyword:
 			| READ
 			| REAL
 			| REASSIGN
-			| RECHECK
 			| RECURSIVE
 			| REF_P
 			| REFERENCES
@@ -18516,7 +18430,6 @@ bare_label_keyword:
 			| SNAPSHOT
 			| SOME
 			| SOURCE
-			| SPLIT
 			| SQL_P
 			| STABLE
 			| STANDALONE_P

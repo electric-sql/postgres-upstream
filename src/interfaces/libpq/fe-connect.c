@@ -50,6 +50,7 @@
 #include <netdb.h>
 #include <netinet/in.h>
 #include <netinet/tcp.h>
+#include <pwd.h>
 #endif
 
 #ifdef WIN32
@@ -274,7 +275,7 @@ static const internalPQconninfoOption PQconninfoOptions[] = {
 	offsetof(struct pg_conn, sslmode)},
 
 	{"sslnegotiation", "PGSSLNEGOTIATION", DefaultSSLNegotiation, NULL,
-		"SSL-Negotiation", "", 14,	/* sizeof("requiredirect") == 14 */
+		"SSL-Negotiation", "", 9,	/* sizeof("postgres") == 9  */
 	offsetof(struct pg_conn, sslnegotiation)},
 
 	{"sslcompression", "PGSSLCOMPRESSION", "0", NULL,
@@ -397,7 +398,7 @@ static bool init_allowed_encryption_methods(PGconn *conn);
 static int	encryption_negotiation_failed(PGconn *conn);
 #endif
 static bool connection_failed(PGconn *conn);
-static bool select_next_encryption_method(PGconn *conn, bool negotiation_failure);
+static bool select_next_encryption_method(PGconn *conn, bool have_valid_connection);
 static PGPing internal_ping(PGconn *conn);
 static void pqFreeCommandQueue(PGcmdQueueEntry *queue);
 static bool fillPGconn(PGconn *conn, PQconninfoOption *connOptions);
@@ -947,7 +948,7 @@ fillPGconn(PGconn *conn, PQconninfoOption *connOptions)
  * Copy over option values from srcConn to dstConn
  *
  * Don't put anything cute here --- intelligence should be in
- * connectOptions2 ...
+ * pqConnectOptions2 ...
  *
  * Returns true on success. On failure, returns false and sets error message of
  * dstConn.
@@ -1590,8 +1591,7 @@ pqConnectOptions2(PGconn *conn)
 	if (conn->sslnegotiation)
 	{
 		if (strcmp(conn->sslnegotiation, "postgres") != 0
-			&& strcmp(conn->sslnegotiation, "direct") != 0
-			&& strcmp(conn->sslnegotiation, "requiredirect") != 0)
+			&& strcmp(conn->sslnegotiation, "direct") != 0)
 		{
 			conn->status = CONNECTION_BAD;
 			libpq_append_conn_error(conn, "invalid %s value: \"%s\"",
@@ -1603,11 +1603,30 @@ pqConnectOptions2(PGconn *conn)
 		if (conn->sslnegotiation[0] != 'p')
 		{
 			conn->status = CONNECTION_BAD;
-			libpq_append_conn_error(conn, "sslnegotiation value \"%s\" invalid when SSL support is not compiled in",
-									conn->sslnegotiation);
+			libpq_append_conn_error(conn, "%s value \"%s\" invalid when SSL support is not compiled in",
+									"sslnegotiation", conn->sslnegotiation);
 			return false;
 		}
 #endif
+
+		/*
+		 * Don't allow direct SSL negotiation with sslmode='prefer', because
+		 * that poses a risk of unintentional fallback to plaintext connection
+		 * when connecting to a pre-v17 server that does not support direct
+		 * SSL connections. To keep things simple, don't allow it with
+		 * sslmode='allow' or sslmode='disable' either. If a user goes through
+		 * the trouble of setting sslnegotiation='direct', they probably
+		 * intend to use SSL, and sslmode=disable or allow is probably a user
+		 * user mistake anyway.
+		 */
+		if (conn->sslnegotiation[0] == 'd' &&
+			conn->sslmode[0] != 'r' && conn->sslmode[0] != 'v')
+		{
+			conn->status = CONNECTION_BAD;
+			libpq_append_conn_error(conn, "weak sslmode \"%s\" may not be used with sslnegotiation=direct (use \"require\", \"verify-ca\", or \"verify-full\")",
+									conn->sslmode);
+			return false;
+		}
 	}
 	else
 	{
@@ -1639,7 +1658,7 @@ pqConnectOptions2(PGconn *conn)
 	if (!sslVerifyProtocolVersion(conn->ssl_min_protocol_version))
 	{
 		conn->status = CONNECTION_BAD;
-		libpq_append_conn_error(conn, "invalid %s value: \"%s\"",
+		libpq_append_conn_error(conn, "invalid \"%s\" value: \"%s\"",
 								"ssl_min_protocol_version",
 								conn->ssl_min_protocol_version);
 		return false;
@@ -1647,7 +1666,7 @@ pqConnectOptions2(PGconn *conn)
 	if (!sslVerifyProtocolVersion(conn->ssl_max_protocol_version))
 	{
 		conn->status = CONNECTION_BAD;
-		libpq_append_conn_error(conn, "invalid %s value: \"%s\"",
+		libpq_append_conn_error(conn, "invalid \"%s\" value: \"%s\"",
 								"ssl_max_protocol_version",
 								conn->ssl_max_protocol_version);
 		return false;
@@ -2452,7 +2471,7 @@ int
 pqConnectDBComplete(PGconn *conn)
 {
 	PostgresPollingStatusType flag = PGRES_POLLING_WRITING;
-	time_t		finish_time = ((time_t) -1);
+	pg_usec_time_t end_time = -1;
 	int			timeout = 0;
 	int			last_whichhost = -2;	/* certainly different from whichhost */
 	int			last_whichaddr = -2;	/* certainly different from whichaddr */
@@ -2461,7 +2480,7 @@ pqConnectDBComplete(PGconn *conn)
 		return 0;
 
 	/*
-	 * Set up a time limit, if connect_timeout isn't zero.
+	 * Set up a time limit, if connect_timeout is greater than zero.
 	 */
 	if (conn->connect_timeout != NULL)
 	{
@@ -2472,19 +2491,6 @@ pqConnectDBComplete(PGconn *conn)
 			conn->status = CONNECTION_BAD;
 			return 0;
 		}
-
-		if (timeout > 0)
-		{
-			/*
-			 * Rounding could cause connection to fail unexpectedly quickly;
-			 * to prevent possibly waiting hardly-at-all, insist on at least
-			 * two seconds.
-			 */
-			if (timeout < 2)
-				timeout = 2;
-		}
-		else					/* negative means 0 */
-			timeout = 0;
 	}
 
 	for (;;)
@@ -2501,7 +2507,7 @@ pqConnectDBComplete(PGconn *conn)
 			(conn->whichhost != last_whichhost ||
 			 conn->whichaddr != last_whichaddr))
 		{
-			finish_time = time(NULL) + timeout;
+			end_time = PQgetCurrentTimeUSec() + (pg_usec_time_t) timeout * 1000000;
 			last_whichhost = conn->whichhost;
 			last_whichaddr = conn->whichaddr;
 		}
@@ -2516,7 +2522,7 @@ pqConnectDBComplete(PGconn *conn)
 				return 1;		/* success! */
 
 			case PGRES_POLLING_READING:
-				ret = pqWaitTimed(1, 0, conn, finish_time);
+				ret = pqWaitTimed(1, 0, conn, end_time);
 				if (ret == -1)
 				{
 					/* hard failure, eg select() problem, aborts everything */
@@ -2526,7 +2532,7 @@ pqConnectDBComplete(PGconn *conn)
 				break;
 
 			case PGRES_POLLING_WRITING:
-				ret = pqWaitTimed(0, 1, conn, finish_time);
+				ret = pqWaitTimed(0, 1, conn, end_time);
 				if (ret == -1)
 				{
 					/* hard failure, eg select() problem, aborts everything */
@@ -2861,12 +2867,17 @@ keep_going:						/* We will come back to here until there is
 		need_new_connection = false;
 	}
 
-	/* Decide what to do next, if SSL or GSS negotiation fails */
-#define ENCRYPTION_NEGOTIATION_FAILED() \
+	/*
+	 * Decide what to do next, if server rejects SSL or GSS negotiation, but
+	 * the connection is still valid.  If there are no options left, error out
+	 * with 'msg'.
+	 */
+#define ENCRYPTION_NEGOTIATION_FAILED(msg) \
 	do { \
 		switch (encryption_negotiation_failed(conn)) \
 		{ \
 			case 0: \
+				libpq_append_conn_error(conn, (msg)); \
 				goto error_return; \
 			case 1: \
 				conn->status = CONNECTION_MADE; \
@@ -2877,7 +2888,11 @@ keep_going:						/* We will come back to here until there is
 		} \
 	} while(0);
 
-	/* Decide what to do next, if connection fails */
+	/*
+	 * Decide what to do next, if connection fails.  If there are no options
+	 * left, return with an error.  The error message has already been written
+	 * to the connection's error buffer.
+	 */
 #define CONNECTION_FAILED() \
 	do { \
 		if (connection_failed(conn)) \
@@ -3328,52 +3343,45 @@ keep_going:						/* We will come back to here until there is
 #ifdef USE_SSL
 
 				/*
-				 * Enable the libcrypto callbacks before checking if SSL needs
-				 * to be done.  This is done before sending the startup packet
-				 * as depending on the type of authentication done, like MD5
-				 * or SCRAM that use cryptohashes, the callbacks would be
-				 * required even without a SSL connection
+				 * If SSL is enabled, start the SSL negotiation. We will come
+				 * back here after SSL encryption has been established, with
+				 * ssl_in_use set.
 				 */
-				if (pqsecure_initialize(conn, false, true) < 0)
-					goto error_return;
-
-				/*
-				 * If direct SSL is enabled, jump right into SSL handshake. We
-				 * will come back here after SSL encryption has been
-				 * established, with ssl_in_use set.
-				 */
-				if (conn->current_enc_method == ENC_DIRECT_SSL && !conn->ssl_in_use)
+				if (conn->current_enc_method == ENC_SSL && !conn->ssl_in_use)
 				{
-					conn->status = CONNECTION_SSL_STARTUP;
-					return PGRES_POLLING_WRITING;
-				}
-
-				/*
-				 * If negotiated SSL is enabled, request SSL and proceed with
-				 * SSL handshake.  We will come back here after SSL encryption
-				 * has been established, with ssl_in_use set.
-				 */
-				if (conn->current_enc_method == ENC_NEGOTIATED_SSL && !conn->ssl_in_use)
-				{
-					ProtocolVersion pv;
-
 					/*
-					 * Send the SSL request packet.
-					 *
-					 * Theoretically, this could block, but it really
-					 * shouldn't since we only got here if the socket is
-					 * write-ready.
+					 * If traditional postgres SSL negotiation is used, send
+					 * the SSL request.  In direct negotiation, jump straight
+					 * into the SSL handshake.
 					 */
-					pv = pg_hton32(NEGOTIATE_SSL_CODE);
-					if (pqPacketSend(conn, 0, &pv, sizeof(pv)) != STATUS_OK)
+					if (conn->sslnegotiation[0] == 'p')
 					{
-						libpq_append_conn_error(conn, "could not send SSL negotiation packet: %s",
-												SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
-						goto error_return;
+						ProtocolVersion pv;
+
+						/*
+						 * Send the SSL request packet.
+						 *
+						 * Theoretically, this could block, but it really
+						 * shouldn't since we only got here if the socket is
+						 * write-ready.
+						 */
+						pv = pg_hton32(NEGOTIATE_SSL_CODE);
+						if (pqPacketSend(conn, 0, &pv, sizeof(pv)) != STATUS_OK)
+						{
+							libpq_append_conn_error(conn, "could not send SSL negotiation packet: %s",
+													SOCK_STRERROR(SOCK_ERRNO, sebuf, sizeof(sebuf)));
+							goto error_return;
+						}
+						/* Ok, wait for response */
+						conn->status = CONNECTION_SSL_STARTUP;
+						return PGRES_POLLING_READING;
 					}
-					/* Ok, wait for response */
-					conn->status = CONNECTION_SSL_STARTUP;
-					return PGRES_POLLING_READING;
+					else
+					{
+						Assert(conn->sslnegotiation[0] == 'd');
+						conn->status = CONNECTION_SSL_STARTUP;
+						return PGRES_POLLING_WRITING;
+					}
 				}
 #endif							/* USE_SSL */
 
@@ -3444,11 +3452,11 @@ keep_going:						/* We will come back to here until there is
 				PostgresPollingStatusType pollres;
 
 				/*
-				 * On first time through, get the postmaster's response to our
-				 * SSL negotiation packet. If we are trying a direct ssl
-				 * connection, go straight to initiating ssl.
+				 * On first time through with traditional SSL negotiation, get
+				 * the postmaster's response to our SSLRequest packet. With
+				 * sslnegotiation='direct', go straight to initiating SSL.
 				 */
-				if (!conn->ssl_in_use && conn->current_enc_method == ENC_NEGOTIATED_SSL)
+				if (!conn->ssl_in_use && conn->sslnegotiation[0] == 'p')
 				{
 					/*
 					 * We use pqReadData here since it has the logic to
@@ -3476,16 +3484,26 @@ keep_going:						/* We will come back to here until there is
 					}
 					if (SSLok == 'S')
 					{
+						if (conn->Pfdebug)
+							pqTraceOutputCharResponse(conn, "SSLResponse",
+													  SSLok);
 						/* mark byte consumed */
 						conn->inStart = conn->inCursor;
 					}
 					else if (SSLok == 'N')
 					{
+						if (conn->Pfdebug)
+							pqTraceOutputCharResponse(conn, "SSLResponse",
+													  SSLok);
 						/* mark byte consumed */
 						conn->inStart = conn->inCursor;
-						/* OK to do without SSL? */
-						/* We can proceed using this connection */
-						ENCRYPTION_NEGOTIATION_FAILED();
+
+						/*
+						 * The connection is still valid, so if it's OK to
+						 * continue without SSL, we can proceed using this
+						 * connection.  Otherwise return with an error.
+						 */
+						ENCRYPTION_NEGOTIATION_FAILED(libpq_gettext("server does not support SSL, but SSL was required"));
 					}
 					else if (SSLok == 'E')
 					{
@@ -3500,6 +3518,12 @@ keep_going:						/* We will come back to here until there is
 						 * byte here.
 						 */
 						conn->status = CONNECTION_AWAITING_RESPONSE;
+
+						/*
+						 * Don't fall back to a plaintext connection after
+						 * reading the error.
+						 */
+						conn->failed_enc_methods |= conn->allowed_enc_methods & (~conn->current_enc_method);
 						goto keep_going;
 					}
 					else
@@ -3509,14 +3533,6 @@ keep_going:						/* We will come back to here until there is
 						goto error_return;
 					}
 				}
-
-				/*
-				 * Set up global SSL state if required.  The crypto state has
-				 * already been set if libpq took care of doing that, so there
-				 * is no need to make that happen again.
-				 */
-				if (pqsecure_initialize(conn, true, false) != 0)
-					goto error_return;
 
 				/*
 				 * Begin or continue the SSL negotiation process.
@@ -3543,8 +3559,8 @@ keep_going:						/* We will come back to here until there is
 				if (pollres == PGRES_POLLING_FAILED)
 				{
 					/*
-					 * Failed direct ssl connection, possibly try a new
-					 * connection with postgres negotiation
+					 * SSL handshake failed.  We will retry with a plaintext
+					 * connection, if permitted by sslmode.
 					 */
 					CONNECTION_FAILED();
 				}
@@ -3583,13 +3599,24 @@ keep_going:						/* We will come back to here until there is
 					if (gss_ok == 'E')
 					{
 						/*
-						 * Server failure of some sort.  Assume it's a
-						 * protocol version support failure, and let's see if
-						 * we can't recover (if it's not, we'll get a better
-						 * error message on retry).  Server gets fussy if we
-						 * don't hang up the socket, though.
+						 * Server failure of some sort, possibly protocol
+						 * version support failure.  We need to process and
+						 * report the error message, which might be formatted
+						 * according to either protocol 2 or protocol 3.
+						 * Rather than duplicate the code for that, we flip
+						 * into AWAITING_RESPONSE state and let the code there
+						 * deal with it.  Note we have *not* consumed the "E"
+						 * byte here.
+						 *
+						 * Note that unlike on an error response to
+						 * SSLRequest, we allow falling back to SSL or
+						 * plaintext connection here.  GSS support was
+						 * introduced in PostgreSQL version 12, so an error
+						 * response might mean that we are connecting to a
+						 * pre-v12 server.
 						 */
-						CONNECTION_FAILED();
+						conn->status = CONNECTION_AWAITING_RESPONSE;
+						goto keep_going;
 					}
 
 					/* mark byte consumed */
@@ -3597,8 +3624,16 @@ keep_going:						/* We will come back to here until there is
 
 					if (gss_ok == 'N')
 					{
-						/* We can proceed using this connection */
-						ENCRYPTION_NEGOTIATION_FAILED();
+						if (conn->Pfdebug)
+							pqTraceOutputCharResponse(conn, "GSSENCResponse",
+													  gss_ok);
+
+						/*
+						 * The connection is still valid, so if it's OK to
+						 * continue without GSS, we can proceed using this
+						 * connection.  Otherwise return with an error.
+						 */
+						ENCRYPTION_NEGOTIATION_FAILED(libpq_gettext("server doesn't support GSSAPI encryption, but it was required"));
 					}
 					else if (gss_ok != 'G')
 					{
@@ -3606,6 +3641,10 @@ keep_going:						/* We will come back to here until there is
 												gss_ok);
 						goto error_return;
 					}
+
+					if (conn->Pfdebug)
+						pqTraceOutputCharResponse(conn, "GSSENCResponse",
+												  gss_ok);
 				}
 
 				/* Begin or continue GSSAPI negotiation */
@@ -3630,6 +3669,10 @@ keep_going:						/* We will come back to here until there is
 				}
 				else if (pollres == PGRES_POLLING_FAILED)
 				{
+					/*
+					 * GSS handshake failed.  We will retry with an SSL or
+					 * plaintext connection, if permitted by the options.
+					 */
 					CONNECTION_FAILED();
 				}
 				/* Else, return POLLING_READING or POLLING_WRITING status */
@@ -3737,7 +3780,7 @@ keep_going:						/* We will come back to here until there is
 						return PGRES_POLLING_READING;
 					}
 					/* OK, we read the message; mark data consumed */
-					conn->inStart = conn->inCursor;
+					pqParseDone(conn, conn->inCursor);
 
 					/*
 					 * Before 7.2, the postmaster didn't always end its
@@ -3787,7 +3830,7 @@ keep_going:						/* We will come back to here until there is
 						goto error_return;
 					}
 					/* OK, we read the message; mark data consumed */
-					conn->inStart = conn->inCursor;
+					pqParseDone(conn, conn->inCursor);
 
 					/*
 					 * If error is "cannot connect now", try the next host if
@@ -3816,7 +3859,7 @@ keep_going:						/* We will come back to here until there is
 						goto error_return;
 					}
 					/* OK, we read the message; mark data consumed */
-					conn->inStart = conn->inCursor;
+					pqParseDone(conn, conn->inCursor);
 					goto error_return;
 				}
 
@@ -3841,7 +3884,11 @@ keep_going:						/* We will come back to here until there is
 				 */
 				res = pg_fe_sendauth(areq, msgLength, conn);
 
-				/* OK, we have processed the message; mark data consumed */
+				/*
+				 * OK, we have processed the message; mark data consumed.  We
+				 * don't call pqParseDone here because we already traced this
+				 * message inside pg_fe_sendauth.
+				 */
 				conn->inStart = conn->inCursor;
 
 				if (res != STATUS_OK)
@@ -4261,7 +4308,7 @@ init_allowed_encryption_methods(PGconn *conn)
 	if (conn->raddr.addr.ss_family == AF_UNIX)
 	{
 		/* Don't request SSL or GSSAPI over Unix sockets */
-		conn->allowed_enc_methods &= ~(ENC_DIRECT_SSL | ENC_NEGOTIATED_SSL | ENC_GSSAPI);
+		conn->allowed_enc_methods &= ~(ENC_SSL | ENC_GSSAPI);
 
 		/*
 		 * XXX: we probably should not do this. sslmode=require works
@@ -4270,7 +4317,7 @@ init_allowed_encryption_methods(PGconn *conn)
 		if (conn->gssencmode[0] == 'r')
 		{
 			libpq_append_conn_error(conn,
-									"GSSAPI encryption required but it is not supported over a local socket)");
+									"GSSAPI encryption required but it is not supported over a local socket");
 			conn->allowed_enc_methods = 0;
 			conn->current_enc_method = ENC_ERROR;
 			return false;
@@ -4288,12 +4335,7 @@ init_allowed_encryption_methods(PGconn *conn)
 	/* sslmode anything but 'disable', and GSSAPI not required */
 	if (conn->sslmode[0] != 'd' && conn->gssencmode[0] != 'r')
 	{
-		if (conn->sslnegotiation[0] == 'p')
-			conn->allowed_enc_methods |= ENC_NEGOTIATED_SSL;
-		else if (conn->sslnegotiation[0] == 'd')
-			conn->allowed_enc_methods |= ENC_DIRECT_SSL | ENC_NEGOTIATED_SSL;
-		else if (conn->sslnegotiation[0] == 'r')
-			conn->allowed_enc_methods |= ENC_DIRECT_SSL;
+		conn->allowed_enc_methods |= ENC_SSL;
 	}
 #endif
 
@@ -4333,7 +4375,8 @@ encryption_negotiation_failed(PGconn *conn)
 
 	if (select_next_encryption_method(conn, true))
 	{
-		if (conn->current_enc_method == ENC_DIRECT_SSL)
+		/* An existing connection cannot be reused for direct SSL */
+		if (conn->current_enc_method == ENC_SSL && conn->sslnegotiation[0] == 'd')
 			return 2;
 		else
 			return 1;
@@ -4354,18 +4397,6 @@ connection_failed(PGconn *conn)
 {
 	Assert((conn->failed_enc_methods & conn->current_enc_method) == 0);
 	conn->failed_enc_methods |= conn->current_enc_method;
-
-	/*
-	 * If the server reported an error after the SSL handshake, no point in
-	 * retrying with negotiated vs direct SSL.
-	 */
-	if ((conn->current_enc_method & (ENC_DIRECT_SSL | ENC_NEGOTIATED_SSL)) != 0 &&
-		conn->ssl_handshake_started)
-	{
-		conn->failed_enc_methods |= (ENC_DIRECT_SSL | ENC_NEGOTIATED_SSL) & conn->allowed_enc_methods;
-	}
-	else
-		conn->failed_enc_methods |= conn->current_enc_method;
 
 	return select_next_encryption_method(conn, false);
 }
@@ -4424,23 +4455,17 @@ select_next_encryption_method(PGconn *conn, bool have_valid_connection)
 	SELECT_NEXT_METHOD(ENC_GSSAPI);
 #endif
 
-	/* With sslmode=allow, try plaintext connection before SSL. */
+	/*
+	 * The order between SSL encryption and plaintext depends on sslmode. With
+	 * sslmode=allow, try plaintext connection before SSL. With
+	 * sslmode=prefer, it's the other way round. With other modes, we only try
+	 * plaintext or SSL connections so the order they're listed here doesn't
+	 * matter.
+	 */
 	if (conn->sslmode[0] == 'a')
 		SELECT_NEXT_METHOD(ENC_PLAINTEXT);
 
-	/*
-	 * If enabled, try direct SSL. Unless we have a valid TCP connection that
-	 * failed negotiating GSSAPI encryption or a plaintext connection in case
-	 * of sslmode='allow'; in that case we prefer to reuse the connection with
-	 * negotiated SSL, instead of reconnecting to do direct SSL. The point of
-	 * direct SSL is to avoid the roundtrip from the negotiation, but
-	 * reconnecting would also incur a roundtrip.
-	 */
-	if (have_valid_connection)
-		SELECT_NEXT_METHOD(ENC_NEGOTIATED_SSL);
-
-	SELECT_NEXT_METHOD(ENC_DIRECT_SSL);
-	SELECT_NEXT_METHOD(ENC_NEGOTIATED_SSL);
+	SELECT_NEXT_METHOD(ENC_SSL);
 
 	if (conn->sslmode[0] != 'a')
 		SELECT_NEXT_METHOD(ENC_PLAINTEXT);
@@ -7134,6 +7159,16 @@ PQprotocolVersion(const PGconn *conn)
 }
 
 int
+PQfullProtocolVersion(const PGconn *conn)
+{
+	if (!conn)
+		return 0;
+	if (conn->status == CONNECTION_BAD)
+		return 0;
+	return PG_PROTOCOL_FULL(conn->pversion);
+}
+
+int
 PQserverVersion(const PGconn *conn)
 {
 	if (!conn)
@@ -7414,7 +7449,9 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 				 const char *username, const char *pgpassfile)
 {
 	FILE	   *fp;
+#ifndef WIN32
 	struct stat stat_buf;
+#endif
 	PQExpBufferData buf;
 
 	if (dbname == NULL || dbname[0] == '\0')
@@ -7439,10 +7476,14 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 		port = DEF_PGPORT_STR;
 
 	/* If password file cannot be opened, ignore it. */
-	if (stat(pgpassfile, &stat_buf) != 0)
+	fp = fopen(pgpassfile, "r");
+	if (fp == NULL)
 		return NULL;
 
 #ifndef WIN32
+	if (fstat(fileno(fp), &stat_buf) != 0)
+		return NULL;
+
 	if (!S_ISREG(stat_buf.st_mode))
 	{
 		fprintf(stderr,
@@ -7466,10 +7507,6 @@ passwordFromFile(const char *hostname, const char *port, const char *dbname,
 	 * file.
 	 */
 #endif
-
-	fp = fopen(pgpassfile, "r");
-	if (fp == NULL)
-		return NULL;
 
 	/* Use an expansible buffer to accommodate any reasonable line length */
 	initPQExpBuffer(&buf);
@@ -7658,10 +7695,24 @@ pqGetHomeDirectory(char *buf, int bufsize)
 	const char *home;
 
 	home = getenv("HOME");
-	if (home == NULL || home[0] == '\0')
-		return pg_get_user_home_dir(geteuid(), buf, bufsize);
-	strlcpy(buf, home, bufsize);
-	return true;
+	if (home && home[0])
+	{
+		strlcpy(buf, home, bufsize);
+		return true;
+	}
+	else
+	{
+		struct passwd pwbuf;
+		struct passwd *pw;
+		char		tmpbuf[1024];
+		int			rc;
+
+		rc = getpwuid_r(geteuid(), &pwbuf, tmpbuf, sizeof tmpbuf, &pw);
+		if (rc != 0 || !pw)
+			return false;
+		strlcpy(buf, pw->pw_dir, bufsize);
+		return true;
+	}
 #else
 	char		tmppath[MAX_PATH];
 

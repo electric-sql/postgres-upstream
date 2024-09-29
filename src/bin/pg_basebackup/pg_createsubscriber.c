@@ -26,6 +26,7 @@
 #include "common/restricted_token.h"
 #include "fe_utils/recovery_gen.h"
 #include "fe_utils/simple_list.h"
+#include "fe_utils/string_utils.h"
 #include "getopt_long.h"
 
 #define	DEFAULT_SUB_PORT	"50432"
@@ -47,7 +48,6 @@ struct CreateSubscriberOptions
 
 struct LogicalRepInfo
 {
-	Oid			oid;			/* database OID */
 	char	   *dbname;			/* database name */
 	char	   *pubconninfo;	/* publisher connection string */
 	char	   *subconninfo;	/* subscriber connection string */
@@ -85,13 +85,15 @@ static void setup_recovery(const struct LogicalRepInfo *dbinfo, const char *data
 						   const char *lsn);
 static void drop_primary_replication_slot(struct LogicalRepInfo *dbinfo,
 										  const char *slotname);
+static void drop_failover_replication_slots(struct LogicalRepInfo *dbinfo);
 static char *create_logical_replication_slot(PGconn *conn,
 											 struct LogicalRepInfo *dbinfo);
 static void drop_replication_slot(PGconn *conn, struct LogicalRepInfo *dbinfo,
 								  const char *slot_name);
 static void pg_ctl_status(const char *pg_ctl_cmd, int rc);
 static void start_standby_server(const struct CreateSubscriberOptions *opt,
-								 bool restricted_access);
+								 bool restricted_access,
+								 bool restrict_logical_worker);
 static void stop_standby_server(const char *datadir);
 static void wait_for_end_recovery(const char *conninfo,
 								  const struct CreateSubscriberOptions *opt);
@@ -101,6 +103,10 @@ static void create_subscription(PGconn *conn, const struct LogicalRepInfo *dbinf
 static void set_replication_progress(PGconn *conn, const struct LogicalRepInfo *dbinfo,
 									 const char *lsn);
 static void enable_subscription(PGconn *conn, const struct LogicalRepInfo *dbinfo);
+static void check_and_drop_existing_subscriptions(PGconn *conn,
+												  const struct LogicalRepInfo *dbinfo);
+static void drop_existing_subscriptions(PGconn *conn, const char *subname,
+										const char *dbname);
 
 #define	USEC_PER_SEC	1000000
 #define	WAIT_INTERVAL	1		/* 1 second */
@@ -189,13 +195,13 @@ cleanup_objects_atexit(void)
 				 */
 				if (dbinfo[i].made_publication)
 				{
-					pg_log_warning("publication \"%s\" in database \"%s\" on primary might be left behind",
+					pg_log_warning("publication \"%s\" created in database \"%s\" on primary was left behind",
 								   dbinfo[i].pubname, dbinfo[i].dbname);
-					pg_log_warning_hint("Consider dropping this publication before trying again.");
+					pg_log_warning_hint("Drop this publication before trying again.");
 				}
 				if (dbinfo[i].made_replslot)
 				{
-					pg_log_warning("replication slot \"%s\" in database \"%s\" on primary might be left behind",
+					pg_log_warning("replication slot \"%s\" created in database \"%s\" on primary was left behind",
 								   dbinfo[i].replslotname, dbinfo[i].dbname);
 					pg_log_warning_hint("Drop this replication slot soon to avoid retention of WAL files.");
 				}
@@ -215,24 +221,38 @@ usage(void)
 	printf(_("Usage:\n"));
 	printf(_("  %s [OPTION]...\n"), progname);
 	printf(_("\nOptions:\n"));
-	printf(_(" -d, --database=DBNAME               database to create a subscription\n"));
-	printf(_(" -D, --pgdata=DATADIR                location for the subscriber data directory\n"));
-	printf(_(" -n, --dry-run                       dry run, just show what would be done\n"));
-	printf(_(" -p, --subscriber-port=PORT          subscriber port number (default %s)\n"), DEFAULT_SUB_PORT);
-	printf(_(" -P, --publisher-server=CONNSTR      publisher connection string\n"));
-	printf(_(" -s, --socket-directory=DIR          socket directory to use (default current directory)\n"));
-	printf(_(" -t, --recovery-timeout=SECS         seconds to wait for recovery to end\n"));
-	printf(_(" -U, --subscriber-username=NAME      subscriber username\n"));
-	printf(_(" -v, --verbose                       output verbose messages\n"));
-	printf(_("     --config-file=FILENAME          use specified main server configuration\n"
-			 "                                     file when running target cluster\n"));
-	printf(_("     --publication=NAME              publication name\n"));
-	printf(_("     --replication-slot=NAME         replication slot name\n"));
-	printf(_("     --subscription=NAME             subscription name\n"));
-	printf(_(" -V, --version                       output version information, then exit\n"));
-	printf(_(" -?, --help                          show this help, then exit\n"));
+	printf(_("  -d, --database=DBNAME           database in which to create a subscription\n"));
+	printf(_("  -D, --pgdata=DATADIR            location for the subscriber data directory\n"));
+	printf(_("  -n, --dry-run                   dry run, just show what would be done\n"));
+	printf(_("  -p, --subscriber-port=PORT      subscriber port number (default %s)\n"), DEFAULT_SUB_PORT);
+	printf(_("  -P, --publisher-server=CONNSTR  publisher connection string\n"));
+	printf(_("  -s, --socketdir=DIR             socket directory to use (default current dir.)\n"));
+	printf(_("  -t, --recovery-timeout=SECS     seconds to wait for recovery to end\n"));
+	printf(_("  -U, --subscriber-username=NAME  user name for subscriber connection\n"));
+	printf(_("  -v, --verbose                   output verbose messages\n"));
+	printf(_("      --config-file=FILENAME      use specified main server configuration\n"
+			 "                                  file when running target cluster\n"));
+	printf(_("      --publication=NAME          publication name\n"));
+	printf(_("      --replication-slot=NAME     replication slot name\n"));
+	printf(_("      --subscription=NAME         subscription name\n"));
+	printf(_("  -V, --version                   output version information, then exit\n"));
+	printf(_("  -?, --help                      show this help, then exit\n"));
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
 	printf(_("%s home page: <%s>\n"), PACKAGE_NAME, PACKAGE_URL);
+}
+
+/*
+ * Subroutine to append "keyword=value" to a connection string,
+ * with proper quoting of the value.  (We assume keywords don't need that.)
+ */
+static void
+appendConnStrItem(PQExpBuffer buf, const char *keyword, const char *val)
+{
+	if (buf->len > 0)
+		appendPQExpBufferChar(buf, ' ');
+	appendPQExpBufferStr(buf, keyword);
+	appendPQExpBufferChar(buf, '=');
+	appendConnStrVal(buf, val);
 }
 
 /*
@@ -242,8 +262,7 @@ usage(void)
  * Since we might process multiple databases, each database name will be
  * appended to this base connection string to provide a final connection
  * string. If the second argument (dbname) is not null, returns dbname if the
- * provided connection string contains it. If option --database is not
- * provided, uses dbname as the only database to setup the logical replica.
+ * provided connection string contains it.
  *
  * It is the caller's responsibility to free the returned connection string and
  * dbname.
@@ -256,7 +275,6 @@ get_base_conninfo(const char *conninfo, char **dbname)
 	PQconninfoOption *conn_opt;
 	char	   *errmsg = NULL;
 	char	   *ret;
-	int			i;
 
 	conn_opts = PQconninfoParse(conninfo, &errmsg);
 	if (conn_opts == NULL)
@@ -267,22 +285,17 @@ get_base_conninfo(const char *conninfo, char **dbname)
 	}
 
 	buf = createPQExpBuffer();
-	i = 0;
 	for (conn_opt = conn_opts; conn_opt->keyword != NULL; conn_opt++)
 	{
-		if (strcmp(conn_opt->keyword, "dbname") == 0 && conn_opt->val != NULL)
-		{
-			if (dbname)
-				*dbname = pg_strdup(conn_opt->val);
-			continue;
-		}
-
 		if (conn_opt->val != NULL && conn_opt->val[0] != '\0')
 		{
-			if (i > 0)
-				appendPQExpBufferChar(buf, ' ');
-			appendPQExpBuffer(buf, "%s=%s", conn_opt->keyword, conn_opt->val);
-			i++;
+			if (strcmp(conn_opt->keyword, "dbname") == 0)
+			{
+				if (dbname)
+					*dbname = pg_strdup(conn_opt->val);
+				continue;
+			}
+			appendConnStrItem(buf, conn_opt->keyword, conn_opt->val);
 		}
 	}
 
@@ -304,13 +317,13 @@ get_sub_conninfo(const struct CreateSubscriberOptions *opt)
 	PQExpBuffer buf = createPQExpBuffer();
 	char	   *ret;
 
-	appendPQExpBuffer(buf, "port=%s", opt->sub_port);
+	appendConnStrItem(buf, "port", opt->sub_port);
 #if !defined(WIN32)
-	appendPQExpBuffer(buf, " host=%s", opt->socket_dir);
+	appendConnStrItem(buf, "host", opt->socket_dir);
 #endif
 	if (opt->sub_username != NULL)
-		appendPQExpBuffer(buf, " user=%s", opt->sub_username);
-	appendPQExpBuffer(buf, " fallback_application_name=%s", progname);
+		appendConnStrItem(buf, "user", opt->sub_username);
+	appendConnStrItem(buf, "fallback_application_name", progname);
 
 	ret = pg_strdup(buf->data);
 
@@ -401,7 +414,7 @@ concat_conninfo_dbname(const char *conninfo, const char *dbname)
 	Assert(conninfo != NULL);
 
 	appendPQExpBufferStr(buf, conninfo);
-	appendPQExpBuffer(buf, " dbname=%s", dbname);
+	appendConnStrItem(buf, "dbname", dbname);
 
 	ret = pg_strdup(buf->data);
 	destroyPQExpBuffer(buf);
@@ -510,7 +523,7 @@ connect_database(const char *conninfo, bool exit_on_error)
 	res = PQexec(conn, ALWAYS_SECURE_SEARCH_PATH_SQL);
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
-		pg_log_error("could not clear search_path: %s",
+		pg_log_error("could not clear \"search_path\": %s",
 					 PQresultErrorMessage(res));
 		PQclear(res);
 		PQfinish(conn);
@@ -657,7 +670,7 @@ modify_subscriber_sysid(const struct CreateSubscriberOptions *opt)
 		if (rc == 0)
 			pg_log_info("subscriber successfully changed the system identifier");
 		else
-			pg_fatal("subscriber failed to change system identifier: exit code: %d", rc);
+			pg_fatal("could not change system identifier of subscriber: %s", wait_result_to_str(rc));
 	}
 
 	pg_free(cf);
@@ -765,6 +778,28 @@ setup_publisher(struct LogicalRepInfo *dbinfo)
 		else
 			exit(1);
 
+		/*
+		 * Since we are using the LSN returned by the last replication slot as
+		 * recovery_target_lsn, this LSN is ahead of the current WAL position
+		 * and the recovery waits until the publisher writes a WAL record to
+		 * reach the target and ends the recovery. On idle systems, this wait
+		 * time is unpredictable and could lead to failure in promoting the
+		 * subscriber. To avoid that, insert a harmless WAL record.
+		 */
+		if (i == num_dbs - 1 && !dry_run)
+		{
+			PGresult   *res;
+
+			res = PQexec(conn, "SELECT pg_log_standby_snapshot()");
+			if (PQresultStatus(res) != PGRES_TUPLES_OK)
+			{
+				pg_log_error("could not write an additional WAL record: %s",
+							 PQresultErrorMessage(res));
+				disconnect_database(conn, true);
+			}
+			PQclear(res);
+		}
+
 		disconnect_database(conn, false);
 	}
 
@@ -814,6 +849,7 @@ check_publisher(const struct LogicalRepInfo *dbinfo)
 	int			cur_repslots;
 	int			max_walsenders;
 	int			cur_walsenders;
+	int			max_prepared_transactions;
 
 	pg_log_info("checking settings on publisher");
 
@@ -840,23 +876,12 @@ check_publisher(const struct LogicalRepInfo *dbinfo)
 	 * -----------------------------------------------------------------------
 	 */
 	res = PQexec(conn,
-				 "WITH wl AS "
-				 "(SELECT setting AS wallevel FROM pg_catalog.pg_settings "
-				 "WHERE name = 'wal_level'), "
-				 "total_mrs AS "
-				 "(SELECT setting AS tmrs FROM pg_catalog.pg_settings "
-				 "WHERE name = 'max_replication_slots'), "
-				 "cur_mrs AS "
-				 "(SELECT count(*) AS cmrs "
-				 "FROM pg_catalog.pg_replication_slots), "
-				 "total_mws AS "
-				 "(SELECT setting AS tmws FROM pg_catalog.pg_settings "
-				 "WHERE name = 'max_wal_senders'), "
-				 "cur_mws AS "
-				 "(SELECT count(*) AS cmws FROM pg_catalog.pg_stat_activity "
-				 "WHERE backend_type = 'walsender') "
-				 "SELECT wallevel, tmrs, cmrs, tmws, cmws "
-				 "FROM wl, total_mrs, cur_mrs, total_mws, cur_mws");
+				 "SELECT pg_catalog.current_setting('wal_level'),"
+				 " pg_catalog.current_setting('max_replication_slots'),"
+				 " (SELECT count(*) FROM pg_catalog.pg_replication_slots),"
+				 " pg_catalog.current_setting('max_wal_senders'),"
+				 " (SELECT count(*) FROM pg_catalog.pg_stat_activity WHERE backend_type = 'walsender'),"
+				 " pg_catalog.current_setting('max_prepared_transactions')");
 
 	if (PQresultStatus(res) != PGRES_TUPLES_OK)
 	{
@@ -870,6 +895,7 @@ check_publisher(const struct LogicalRepInfo *dbinfo)
 	cur_repslots = atoi(PQgetvalue(res, 0, 2));
 	max_walsenders = atoi(PQgetvalue(res, 0, 3));
 	cur_walsenders = atoi(PQgetvalue(res, 0, 4));
+	max_prepared_transactions = atoi(PQgetvalue(res, 0, 5));
 
 	PQclear(res);
 
@@ -878,53 +904,14 @@ check_publisher(const struct LogicalRepInfo *dbinfo)
 	pg_log_debug("publisher: current replication slots: %d", cur_repslots);
 	pg_log_debug("publisher: max_wal_senders: %d", max_walsenders);
 	pg_log_debug("publisher: current wal senders: %d", cur_walsenders);
-
-	/*
-	 * If standby sets primary_slot_name, check if this replication slot is in
-	 * use on primary for WAL retention purposes. This replication slot has no
-	 * use after the transformation, hence, it will be removed at the end of
-	 * this process.
-	 */
-	if (primary_slot_name)
-	{
-		PQExpBuffer str = createPQExpBuffer();
-		char	   *psn_esc = PQescapeLiteral(conn, primary_slot_name, strlen(primary_slot_name));
-
-		appendPQExpBuffer(str,
-						  "SELECT 1 FROM pg_catalog.pg_replication_slots "
-						  "WHERE active AND slot_name = %s",
-						  psn_esc);
-
-		pg_free(psn_esc);
-
-		pg_log_debug("command is: %s", str->data);
-
-		res = PQexec(conn, str->data);
-		if (PQresultStatus(res) != PGRES_TUPLES_OK)
-		{
-			pg_log_error("could not obtain replication slot information: %s",
-						 PQresultErrorMessage(res));
-			disconnect_database(conn, true);
-		}
-
-		if (PQntuples(res) != 1)
-		{
-			pg_log_error("could not obtain replication slot information: got %d rows, expected %d row",
-						 PQntuples(res), 1);
-			disconnect_database(conn, true);
-		}
-		else
-			pg_log_info("primary has replication slot \"%s\"",
-						primary_slot_name);
-
-		PQclear(res);
-	}
+	pg_log_debug("publisher: max_prepared_transactions: %d",
+				 max_prepared_transactions);
 
 	disconnect_database(conn, false);
 
 	if (strcmp(wal_level, "logical") != 0)
 	{
-		pg_log_error("publisher requires wal_level >= \"logical\"");
+		pg_log_error("publisher requires \"wal_level\" >= \"logical\"");
 		failed = true;
 	}
 
@@ -932,18 +919,25 @@ check_publisher(const struct LogicalRepInfo *dbinfo)
 	{
 		pg_log_error("publisher requires %d replication slots, but only %d remain",
 					 num_dbs, max_repslots - cur_repslots);
-		pg_log_error_hint("Consider increasing max_replication_slots to at least %d.",
-						  cur_repslots + num_dbs);
+		pg_log_error_hint("Increase the configuration parameter \"%s\" to at least %d.",
+						  "max_replication_slots", cur_repslots + num_dbs);
 		failed = true;
 	}
 
 	if (max_walsenders - cur_walsenders < num_dbs)
 	{
-		pg_log_error("publisher requires %d wal sender processes, but only %d remain",
+		pg_log_error("publisher requires %d WAL sender processes, but only %d remain",
 					 num_dbs, max_walsenders - cur_walsenders);
-		pg_log_error_hint("Consider increasing max_wal_senders to at least %d.",
-						  cur_walsenders + num_dbs);
+		pg_log_error_hint("Increase the configuration parameter \"%s\" to at least %d.",
+						  "max_wal_senders", cur_walsenders + num_dbs);
 		failed = true;
+	}
+
+	if (max_prepared_transactions != 0)
+	{
+		pg_log_warning("two_phase option will not be enabled for replication slots");
+		pg_log_warning_detail("Subscriptions will be created with the two_phase option disabled.  "
+							  "Prepared transactions will be replicated at COMMIT PREPARED.");
 	}
 
 	pg_free(wal_level);
@@ -1031,8 +1025,8 @@ check_subscriber(const struct LogicalRepInfo *dbinfo)
 	{
 		pg_log_error("subscriber requires %d replication slots, but only %d remain",
 					 num_dbs, max_repslots);
-		pg_log_error_hint("Consider increasing max_replication_slots to at least %d.",
-						  num_dbs);
+		pg_log_error_hint("Increase the configuration parameter \"%s\" to at least %d.",
+						  "max_replication_slots", num_dbs);
 		failed = true;
 	}
 
@@ -1040,8 +1034,8 @@ check_subscriber(const struct LogicalRepInfo *dbinfo)
 	{
 		pg_log_error("subscriber requires %d logical replication workers, but only %d remain",
 					 num_dbs, max_lrworkers);
-		pg_log_error_hint("Consider increasing max_logical_replication_workers to at least %d.",
-						  num_dbs);
+		pg_log_error_hint("Increase the configuration parameter \"%s\" to at least %d.",
+						  "max_logical_replication_workers", num_dbs);
 		failed = true;
 	}
 
@@ -1049,13 +1043,94 @@ check_subscriber(const struct LogicalRepInfo *dbinfo)
 	{
 		pg_log_error("subscriber requires %d worker processes, but only %d remain",
 					 num_dbs + 1, max_wprocs);
-		pg_log_error_hint("Consider increasing max_worker_processes to at least %d.",
-						  num_dbs + 1);
+		pg_log_error_hint("Increase the configuration parameter \"%s\" to at least %d.",
+						  "max_worker_processes", num_dbs + 1);
 		failed = true;
 	}
 
 	if (failed)
 		exit(1);
+}
+
+/*
+ * Drop a specified subscription. This is to avoid duplicate subscriptions on
+ * the primary (publisher node) and the newly created subscriber. We
+ * shouldn't drop the associated slot as that would be used by the publisher
+ * node.
+ */
+static void
+drop_existing_subscriptions(PGconn *conn, const char *subname, const char *dbname)
+{
+	PQExpBuffer query = createPQExpBuffer();
+	PGresult   *res;
+
+	Assert(conn != NULL);
+
+	/*
+	 * Construct a query string. These commands are allowed to be executed
+	 * within a transaction.
+	 */
+	appendPQExpBuffer(query, "ALTER SUBSCRIPTION %s DISABLE;",
+					  subname);
+	appendPQExpBuffer(query, " ALTER SUBSCRIPTION %s SET (slot_name = NONE);",
+					  subname);
+	appendPQExpBuffer(query, " DROP SUBSCRIPTION %s;", subname);
+
+	pg_log_info("dropping subscription \"%s\" in database \"%s\"",
+				subname, dbname);
+
+	if (!dry_run)
+	{
+		res = PQexec(conn, query->data);
+
+		if (PQresultStatus(res) != PGRES_COMMAND_OK)
+		{
+			pg_log_error("could not drop subscription \"%s\": %s",
+						 subname, PQresultErrorMessage(res));
+			disconnect_database(conn, true);
+		}
+
+		PQclear(res);
+	}
+
+	destroyPQExpBuffer(query);
+}
+
+/*
+ * Retrieve and drop the pre-existing subscriptions.
+ */
+static void
+check_and_drop_existing_subscriptions(PGconn *conn,
+									  const struct LogicalRepInfo *dbinfo)
+{
+	PQExpBuffer query = createPQExpBuffer();
+	char	   *dbname;
+	PGresult   *res;
+
+	Assert(conn != NULL);
+
+	dbname = PQescapeLiteral(conn, dbinfo->dbname, strlen(dbinfo->dbname));
+
+	appendPQExpBuffer(query,
+					  "SELECT s.subname FROM pg_catalog.pg_subscription s "
+					  "INNER JOIN pg_catalog.pg_database d ON (s.subdbid = d.oid) "
+					  "WHERE d.datname = %s",
+					  dbname);
+	res = PQexec(conn, query->data);
+
+	if (PQresultStatus(res) != PGRES_TUPLES_OK)
+	{
+		pg_log_error("could not obtain pre-existing subscriptions: %s",
+					 PQresultErrorMessage(res));
+		disconnect_database(conn, true);
+	}
+
+	for (int i = 0; i < PQntuples(res); i++)
+		drop_existing_subscriptions(conn, PQgetvalue(res, i, 0),
+									dbinfo->dbname);
+
+	PQclear(res);
+	destroyPQExpBuffer(query);
 }
 
 /*
@@ -1072,6 +1147,14 @@ setup_subscriber(struct LogicalRepInfo *dbinfo, const char *consistent_lsn)
 
 		/* Connect to subscriber. */
 		conn = connect_database(dbinfo[i].subconninfo, true);
+
+		/*
+		 * We don't need the pre-existing subscriptions on the newly formed
+		 * subscriber. They can connect to other publisher nodes and either
+		 * get some unwarranted data or can lead to ERRORs in connecting to
+		 * such nodes.
+		 */
+		check_and_drop_existing_subscriptions(conn, &dbinfo[i]);
 
 		/*
 		 * Since the publication was created before the consistent LSN, it is
@@ -1179,6 +1262,49 @@ drop_primary_replication_slot(struct LogicalRepInfo *dbinfo, const char *slotnam
 }
 
 /*
+ * Drop failover replication slots on subscriber. After the transformation,
+ * they have no use.
+ *
+ * XXX We do not fail here. Instead, we provide a warning so the user can drop
+ * them later.
+ */
+static void
+drop_failover_replication_slots(struct LogicalRepInfo *dbinfo)
+{
+	PGconn	   *conn;
+	PGresult   *res;
+
+	conn = connect_database(dbinfo[0].subconninfo, false);
+	if (conn != NULL)
+	{
+		/* Get failover replication slot names */
+		res = PQexec(conn,
+					 "SELECT slot_name FROM pg_catalog.pg_replication_slots WHERE failover");
+
+		if (PQresultStatus(res) == PGRES_TUPLES_OK)
+		{
+			/* Remove failover replication slots from subscriber */
+			for (int i = 0; i < PQntuples(res); i++)
+				drop_replication_slot(conn, &dbinfo[0], PQgetvalue(res, i, 0));
+		}
+		else
+		{
+			pg_log_warning("could not obtain failover replication slot information: %s",
+						   PQresultErrorMessage(res));
+			pg_log_warning_hint("Drop the failover replication slots on subscriber soon to avoid retention of WAL files.");
+		}
+
+		PQclear(res);
+		disconnect_database(conn, false);
+	}
+	else
+	{
+		pg_log_warning("could not drop failover replication slot");
+		pg_log_warning_hint("Drop the failover replication slots on subscriber soon to avoid retention of WAL files.");
+	}
+}
+
+/*
  * Create a logical replication slot and returns a LSN.
  *
  * CreateReplicationSlot() is not used because it does not provide the one-row
@@ -1195,7 +1321,7 @@ create_logical_replication_slot(PGconn *conn, struct LogicalRepInfo *dbinfo)
 
 	Assert(conn != NULL);
 
-	pg_log_info("creating the replication slot \"%s\" on database \"%s\"",
+	pg_log_info("creating the replication slot \"%s\" in database \"%s\"",
 				slot_name, dbinfo->dbname);
 
 	slot_name_esc = PQescapeLiteral(conn, slot_name, strlen(slot_name));
@@ -1213,7 +1339,7 @@ create_logical_replication_slot(PGconn *conn, struct LogicalRepInfo *dbinfo)
 		res = PQexec(conn, str->data);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
-			pg_log_error("could not create replication slot \"%s\" on database \"%s\": %s",
+			pg_log_error("could not create replication slot \"%s\" in database \"%s\": %s",
 						 slot_name, dbinfo->dbname,
 						 PQresultErrorMessage(res));
 			PQclear(res);
@@ -1243,7 +1369,7 @@ drop_replication_slot(PGconn *conn, struct LogicalRepInfo *dbinfo,
 
 	Assert(conn != NULL);
 
-	pg_log_info("dropping the replication slot \"%s\" on database \"%s\"",
+	pg_log_info("dropping the replication slot \"%s\" in database \"%s\"",
 				slot_name, dbinfo->dbname);
 
 	slot_name_esc = PQescapeLiteral(conn, slot_name, strlen(slot_name));
@@ -1259,7 +1385,7 @@ drop_replication_slot(PGconn *conn, struct LogicalRepInfo *dbinfo,
 		res = PQexec(conn, str->data);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
-			pg_log_error("could not drop replication slot \"%s\" on database \"%s\": %s",
+			pg_log_error("could not drop replication slot \"%s\" in database \"%s\": %s",
 						 slot_name, dbinfo->dbname, PQresultErrorMessage(res));
 			dbinfo->made_replslot = false;	/* don't try again. */
 		}
@@ -1304,13 +1430,15 @@ pg_ctl_status(const char *pg_ctl_cmd, int rc)
 }
 
 static void
-start_standby_server(const struct CreateSubscriberOptions *opt, bool restricted_access)
+start_standby_server(const struct CreateSubscriberOptions *opt, bool restricted_access,
+					 bool restrict_logical_worker)
 {
 	PQExpBuffer pg_ctl_cmd = createPQExpBuffer();
 	int			rc;
 
-	appendPQExpBuffer(pg_ctl_cmd, "\"%s\" start -D \"%s\" -s",
-					  pg_ctl_path, subscriber_dir);
+	appendPQExpBuffer(pg_ctl_cmd, "\"%s\" start -D ", pg_ctl_path);
+	appendShellString(pg_ctl_cmd, subscriber_dir);
+	appendPQExpBuffer(pg_ctl_cmd, " -s -o \"-c sync_replication_slots=off\"");
 	if (restricted_access)
 	{
 		appendPQExpBuffer(pg_ctl_cmd, " -o \"-p %s\"", opt->sub_port);
@@ -1332,6 +1460,11 @@ start_standby_server(const struct CreateSubscriberOptions *opt, bool restricted_
 	if (opt->config_file != NULL)
 		appendPQExpBuffer(pg_ctl_cmd, " -o \"-c config_file=%s\"",
 						  opt->config_file);
+
+	/* Suppress to start logical replication if requested */
+	if (restrict_logical_worker)
+		appendPQExpBuffer(pg_ctl_cmd, " -o \"-c max_logical_replication_workers=0\"");
+
 	pg_log_debug("pg_ctl command is: %s", pg_ctl_cmd->data);
 	rc = system(pg_ctl_cmd->data);
 	pg_ctl_status(pg_ctl_cmd->data, rc);
@@ -1360,6 +1493,9 @@ stop_standby_server(const char *datadir)
  *
  * If recovery_timeout option is set, terminate abnormally without finishing
  * the recovery process. By default, it waits forever.
+ *
+ * XXX Is the recovery process still in progress? When recovery process has a
+ * better progress reporting mechanism, it should be added here.
  */
 static void
 wait_for_end_recovery(const char *conninfo, const struct CreateSubscriberOptions *opt)
@@ -1367,9 +1503,6 @@ wait_for_end_recovery(const char *conninfo, const struct CreateSubscriberOptions
 	PGconn	   *conn;
 	int			status = POSTMASTER_STILL_STARTING;
 	int			timer = 0;
-	int			count = 0;		/* number of consecutive connection attempts */
-
-#define NUM_CONN_ATTEMPTS	10
 
 	pg_log_info("waiting for the target server to reach the consistent state");
 
@@ -1377,7 +1510,6 @@ wait_for_end_recovery(const char *conninfo, const struct CreateSubscriberOptions
 
 	for (;;)
 	{
-		PGresult   *res;
 		bool		in_recovery = server_is_in_recovery(conn);
 
 		/*
@@ -1390,28 +1522,6 @@ wait_for_end_recovery(const char *conninfo, const struct CreateSubscriberOptions
 			recovery_ended = true;
 			break;
 		}
-
-		/*
-		 * If it is still in recovery, make sure the target server is
-		 * connected to the primary so it can receive the required WAL to
-		 * finish the recovery process. If it is disconnected try
-		 * NUM_CONN_ATTEMPTS in a row and bail out if not succeed.
-		 */
-		res = PQexec(conn,
-					 "SELECT 1 FROM pg_catalog.pg_stat_wal_receiver");
-		if (PQntuples(res) == 0)
-		{
-			if (++count > NUM_CONN_ATTEMPTS)
-			{
-				stop_standby_server(subscriber_dir);
-				pg_log_error("standby server disconnected from the primary");
-				break;
-			}
-		}
-		else
-			count = 0;			/* reset counter if it connects again */
-
-		PQclear(res);
 
 		/* Bail out after recovery_timeout seconds if this option is set */
 		if (opt->recovery_timeout > 0 && timer >= opt->recovery_timeout)
@@ -1482,7 +1592,7 @@ create_publication(PGconn *conn, struct LogicalRepInfo *dbinfo)
 	PQclear(res);
 	resetPQExpBuffer(str);
 
-	pg_log_info("creating publication \"%s\" on database \"%s\"",
+	pg_log_info("creating publication \"%s\" in database \"%s\"",
 				dbinfo->pubname, dbinfo->dbname);
 
 	appendPQExpBuffer(str, "CREATE PUBLICATION %s FOR ALL TABLES",
@@ -1495,7 +1605,7 @@ create_publication(PGconn *conn, struct LogicalRepInfo *dbinfo)
 		res = PQexec(conn, str->data);
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
-			pg_log_error("could not create publication \"%s\" on database \"%s\": %s",
+			pg_log_error("could not create publication \"%s\" in database \"%s\": %s",
 						 dbinfo->pubname, dbinfo->dbname, PQresultErrorMessage(res));
 			disconnect_database(conn, true);
 		}
@@ -1524,7 +1634,7 @@ drop_publication(PGconn *conn, struct LogicalRepInfo *dbinfo)
 
 	pubname_esc = PQescapeIdentifier(conn, dbinfo->pubname, strlen(dbinfo->pubname));
 
-	pg_log_info("dropping publication \"%s\" on database \"%s\"",
+	pg_log_info("dropping publication \"%s\" in database \"%s\"",
 				dbinfo->pubname, dbinfo->dbname);
 
 	appendPQExpBuffer(str, "DROP PUBLICATION %s", pubname_esc);
@@ -1538,7 +1648,7 @@ drop_publication(PGconn *conn, struct LogicalRepInfo *dbinfo)
 		res = PQexec(conn, str->data);
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
-			pg_log_error("could not drop publication \"%s\" on database \"%s\": %s",
+			pg_log_error("could not drop publication \"%s\" in database \"%s\": %s",
 						 dbinfo->pubname, dbinfo->dbname, PQresultErrorMessage(res));
 			dbinfo->made_publication = false;	/* don't try again. */
 
@@ -1584,7 +1694,7 @@ create_subscription(PGconn *conn, const struct LogicalRepInfo *dbinfo)
 	pubconninfo_esc = PQescapeLiteral(conn, dbinfo->pubconninfo, strlen(dbinfo->pubconninfo));
 	replslotname_esc = PQescapeLiteral(conn, dbinfo->replslotname, strlen(dbinfo->replslotname));
 
-	pg_log_info("creating subscription \"%s\" on database \"%s\"",
+	pg_log_info("creating subscription \"%s\" in database \"%s\"",
 				dbinfo->subname, dbinfo->dbname);
 
 	appendPQExpBuffer(str,
@@ -1605,7 +1715,7 @@ create_subscription(PGconn *conn, const struct LogicalRepInfo *dbinfo)
 		res = PQexec(conn, str->data);
 		if (PQresultStatus(res) != PGRES_COMMAND_OK)
 		{
-			pg_log_error("could not create subscription \"%s\" on database \"%s\": %s",
+			pg_log_error("could not create subscription \"%s\" in database \"%s\": %s",
 						 dbinfo->subname, dbinfo->dbname, PQresultErrorMessage(res));
 			disconnect_database(conn, true);
 		}
@@ -1681,7 +1791,7 @@ set_replication_progress(PGconn *conn, const struct LogicalRepInfo *dbinfo, cons
 	 */
 	originname = psprintf("pg_%u", suboid);
 
-	pg_log_info("setting the replication progress (node name \"%s\" ; LSN %s) on database \"%s\"",
+	pg_log_info("setting the replication progress (node name \"%s\", LSN %s) in database \"%s\"",
 				originname, lsnstr, dbinfo->dbname);
 
 	resetPQExpBuffer(str);
@@ -1696,7 +1806,7 @@ set_replication_progress(PGconn *conn, const struct LogicalRepInfo *dbinfo, cons
 		res = PQexec(conn, str->data);
 		if (PQresultStatus(res) != PGRES_TUPLES_OK)
 		{
-			pg_log_error("could not set replication progress for the subscription \"%s\": %s",
+			pg_log_error("could not set replication progress for subscription \"%s\": %s",
 						 dbinfo->subname, PQresultErrorMessage(res));
 			disconnect_database(conn, true);
 		}
@@ -1727,7 +1837,7 @@ enable_subscription(PGconn *conn, const struct LogicalRepInfo *dbinfo)
 
 	subname = PQescapeIdentifier(conn, dbinfo->subname, strlen(dbinfo->subname));
 
-	pg_log_info("enabling subscription \"%s\" on database \"%s\"",
+	pg_log_info("enabling subscription \"%s\" in database \"%s\"",
 				dbinfo->subname, dbinfo->dbname);
 
 	appendPQExpBuffer(str, "ALTER SUBSCRIPTION %s ENABLE", subname);
@@ -1761,7 +1871,7 @@ main(int argc, char **argv)
 		{"dry-run", no_argument, NULL, 'n'},
 		{"subscriber-port", required_argument, NULL, 'p'},
 		{"publisher-server", required_argument, NULL, 'P'},
-		{"socket-directory", required_argument, NULL, 's'},
+		{"socketdir", required_argument, NULL, 's'},
 		{"recovery-timeout", required_argument, NULL, 't'},
 		{"subscriber-username", required_argument, NULL, 'U'},
 		{"verbose", no_argument, NULL, 'v'},
@@ -1794,7 +1904,7 @@ main(int argc, char **argv)
 	pg_logging_init(argv[0]);
 	pg_logging_set_level(PG_LOG_WARNING);
 	progname = get_progname(argv[0]);
-	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_createsubscriber"));
+	set_pglocale_pgservice(argv[0], PG_TEXTDOMAIN("pg_basebackup"));
 
 	if (argc > 1)
 	{
@@ -1853,7 +1963,7 @@ main(int argc, char **argv)
 				}
 				else
 				{
-					pg_log_error("duplicate database \"%s\"", optarg);
+					pg_log_error("database \"%s\" specified more than once", optarg);
 					exit(1);
 				}
 				break;
@@ -1894,7 +2004,7 @@ main(int argc, char **argv)
 				}
 				else
 				{
-					pg_log_error("duplicate publication \"%s\"", optarg);
+					pg_log_error("publication \"%s\" specified more than once", optarg);
 					exit(1);
 				}
 				break;
@@ -1906,7 +2016,7 @@ main(int argc, char **argv)
 				}
 				else
 				{
-					pg_log_error("duplicate replication slot \"%s\"", optarg);
+					pg_log_error("replication slot \"%s\" specified more than once", optarg);
 					exit(1);
 				}
 				break;
@@ -1918,7 +2028,7 @@ main(int argc, char **argv)
 				}
 				else
 				{
-					pg_log_error("duplicate subscription \"%s\"", optarg);
+					pg_log_error("subscription \"%s\" specified more than once", optarg);
 					exit(1);
 				}
 				break;
@@ -1973,13 +2083,13 @@ main(int argc, char **argv)
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
-	pg_log_info("validating connection string on publisher");
+	pg_log_info("validating publisher connection string");
 	pub_base_conninfo = get_base_conninfo(opt.pub_conninfo_str,
 										  &dbname_conninfo);
 	if (pub_base_conninfo == NULL)
 		exit(1);
 
-	pg_log_info("validating connection string on subscriber");
+	pg_log_info("validating subscriber connection string");
 	sub_base_conninfo = get_sub_conninfo(&opt);
 
 	if (opt.database_names.head == NULL)
@@ -1996,7 +2106,7 @@ main(int argc, char **argv)
 			simple_string_list_append(&opt.database_names, dbname_conninfo);
 			num_dbs++;
 
-			pg_log_info("database \"%s\" was extracted from the publisher connection string",
+			pg_log_info("database name \"%s\" was extracted from the publisher connection string",
 						dbname_conninfo);
 		}
 		else
@@ -2011,23 +2121,23 @@ main(int argc, char **argv)
 	/* Number of object names must match number of databases */
 	if (num_pubs > 0 && num_pubs != num_dbs)
 	{
-		pg_log_error("wrong number of publication names");
-		pg_log_error_hint("Number of publication names (%d) must match number of database names (%d).",
-						  num_pubs, num_dbs);
+		pg_log_error("wrong number of publication names specified");
+		pg_log_error_detail("The number of specified publication names (%d) must match the number of specified database names (%d).",
+							num_pubs, num_dbs);
 		exit(1);
 	}
 	if (num_subs > 0 && num_subs != num_dbs)
 	{
-		pg_log_error("wrong number of subscription names");
-		pg_log_error_hint("Number of subscription names (%d) must match number of database names (%d).",
-						  num_subs, num_dbs);
+		pg_log_error("wrong number of subscription names specified");
+		pg_log_error_detail("The number of specified subscription names (%d) must match the number of specified database names (%d).",
+							num_subs, num_dbs);
 		exit(1);
 	}
 	if (num_replslots > 0 && num_replslots != num_dbs)
 	{
-		pg_log_error("wrong number of replication slot names");
-		pg_log_error_hint("Number of replication slot names (%d) must match number of database names (%d).",
-						  num_replslots, num_dbs);
+		pg_log_error("wrong number of replication slot names specified");
+		pg_log_error_detail("The number of specified replication slot names (%d) must match the number of specified database names (%d).",
+							num_replslots, num_dbs);
 		exit(1);
 	}
 
@@ -2068,8 +2178,8 @@ main(int argc, char **argv)
 	 */
 	if (stat(pidfile, &statbuf) == 0)
 	{
-		pg_log_error("standby is up and running");
-		pg_log_error_hint("Stop the standby and try again.");
+		pg_log_error("standby server is running");
+		pg_log_error_hint("Stop the standby server and try again.");
 		exit(1);
 	}
 
@@ -2078,18 +2188,13 @@ main(int argc, char **argv)
 	 * by command-line options). The goal is to avoid connections during the
 	 * transformation steps.
 	 */
-	pg_log_info("starting the standby with command-line options");
-	start_standby_server(&opt, true);
+	pg_log_info("starting the standby server with command-line options");
+	start_standby_server(&opt, true, false);
 
 	/* Check if the standby server is ready for logical replication */
 	check_subscriber(dbinfo);
 
-	/*
-	 * Check if the primary server is ready for logical replication. This
-	 * routine checks if a replication slot is in use on primary so it relies
-	 * on check_subscriber() to obtain the primary_slot_name. That's why it is
-	 * called after it.
-	 */
+	/* Check if the primary server is ready for logical replication */
 	check_publisher(dbinfo);
 
 	/*
@@ -2102,12 +2207,7 @@ main(int argc, char **argv)
 	pg_log_info("stopping the subscriber");
 	stop_standby_server(subscriber_dir);
 
-	/*
-	 * Create the required objects for each database on publisher. This step
-	 * is here mainly because if we stop the standby we cannot verify if the
-	 * primary slot is in use. We could use an extra connection for it but it
-	 * doesn't seem worth.
-	 */
+	/* Create the required objects for each database on publisher */
 	consistent_lsn = setup_publisher(dbinfo);
 
 	/* Write the required recovery parameters */
@@ -2115,10 +2215,11 @@ main(int argc, char **argv)
 
 	/*
 	 * Start subscriber so the recovery parameters will take effect. Wait
-	 * until accepting connections.
+	 * until accepting connections. We don't want to start logical replication
+	 * during setup.
 	 */
 	pg_log_info("starting the subscriber");
-	start_standby_server(&opt, true);
+	start_standby_server(&opt, true, true);
 
 	/* Waiting the subscriber to be promoted */
 	wait_for_end_recovery(dbinfo[0].subconninfo, &opt);
@@ -2133,6 +2234,9 @@ main(int argc, char **argv)
 
 	/* Remove primary_slot_name if it exists on primary */
 	drop_primary_replication_slot(dbinfo, primary_slot_name);
+
+	/* Remove failover replication slots if they exist on subscriber */
+	drop_failover_replication_slots(dbinfo);
 
 	/* Stop the subscriber */
 	pg_log_info("stopping the subscriber");

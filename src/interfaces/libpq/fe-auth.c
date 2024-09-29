@@ -28,6 +28,7 @@
 #include <unistd.h>
 #include <fcntl.h>
 #include <limits.h>
+#include <pwd.h>
 #include <sys/param.h>			/* for MAXHOSTNAMELEN on most */
 #include <sys/socket.h>
 #ifdef HAVE_SYS_UCRED_H
@@ -94,6 +95,10 @@ pg_GSS_continue(PGconn *conn, int payloadlen)
 		ginbuf.value = NULL;
 	}
 
+	/* finished parsing, trace server-to-client message */
+	if (conn->Pfdebug)
+		pqTraceOutputMessage(conn, conn->inBuffer + conn->inStart, false);
+
 	/* Only try to acquire credentials if GSS delegation isn't disabled. */
 	if (!pg_GSS_have_cred_cache(&conn->gcred))
 		conn->gcred = GSS_C_NO_CREDENTIAL;
@@ -124,7 +129,8 @@ pg_GSS_continue(PGconn *conn, int payloadlen)
 		 * first or subsequent packet, just send the same kind of password
 		 * packet.
 		 */
-		if (pqPacketSend(conn, 'p',
+		conn->current_auth_response = AUTH_RESPONSE_GSS;
+		if (pqPacketSend(conn, PqMsg_GSSResponse,
 						 goutbuf.value, goutbuf.length) != STATUS_OK)
 		{
 			gss_release_buffer(&lmin_s, &goutbuf);
@@ -257,6 +263,10 @@ pg_SSPI_continue(PGconn *conn, int payloadlen)
 		InBuffers[0].BufferType = SECBUFFER_TOKEN;
 	}
 
+	/* finished parsing, trace server-to-client message */
+	if (conn->Pfdebug)
+		pqTraceOutputMessage(conn, conn->inBuffer + conn->inStart, false);
+
 	OutBuffers[0].pvBuffer = NULL;
 	OutBuffers[0].BufferType = SECBUFFER_TOKEN;
 	OutBuffers[0].cbBuffer = 0;
@@ -324,7 +334,8 @@ pg_SSPI_continue(PGconn *conn, int payloadlen)
 		 */
 		if (outbuf.pBuffers[0].cbBuffer > 0)
 		{
-			if (pqPacketSend(conn, 'p',
+			conn->current_auth_response = AUTH_RESPONSE_GSS;
+			if (pqPacketSend(conn, PqMsg_GSSResponse,
 							 outbuf.pBuffers[0].pvBuffer, outbuf.pBuffers[0].cbBuffer))
 			{
 				FreeContextBuffer(outbuf.pBuffers[0].pvBuffer);
@@ -561,6 +572,10 @@ pg_SASL_init(PGconn *conn, int payloadlen)
 		}
 	}
 
+	/* finished parsing, trace server-to-client message */
+	if (conn->Pfdebug)
+		pqTraceOutputMessage(conn, conn->inBuffer + conn->inStart, false);
+
 	Assert(conn->sasl);
 
 	/*
@@ -597,8 +612,10 @@ pg_SASL_init(PGconn *conn, int payloadlen)
 		if (pqPutnchar(initialresponse, initialresponselen, conn))
 			goto error;
 	}
+	conn->current_auth_response = AUTH_RESPONSE_SASL_INITIAL;
 	if (pqPutMsgEnd(conn))
 		goto error;
+
 	if (pqFlush(conn))
 		goto error;
 
@@ -647,6 +664,11 @@ pg_SASL_continue(PGconn *conn, int payloadlen, bool final)
 		free(challenge);
 		return STATUS_ERROR;
 	}
+
+	/* finished parsing, trace server-to-client message */
+	if (conn->Pfdebug)
+		pqTraceOutputMessage(conn, conn->inBuffer + conn->inStart, false);
+
 	/* For safety and convenience, ensure the buffer is NULL-terminated. */
 	challenge[payloadlen] = '\0';
 
@@ -683,7 +705,8 @@ pg_SASL_continue(PGconn *conn, int payloadlen, bool final)
 		/*
 		 * Send the SASL response to the server.
 		 */
-		res = pqPacketSend(conn, 'p', output, outputlen);
+		conn->current_auth_response = AUTH_RESPONSE_SASL;
+		res = pqPacketSend(conn, PqMsg_SASLResponse, output, outputlen);
 		free(output);
 
 		if (res != STATUS_OK)
@@ -710,6 +733,10 @@ pg_password_sendauth(PGconn *conn, const char *password, AuthRequest areq)
 		if (pqGetnchar(md5Salt, 4, conn))
 			return STATUS_ERROR;	/* shouldn't happen */
 	}
+
+	/* finished parsing, trace server-to-client message */
+	if (conn->Pfdebug)
+		pqTraceOutputMessage(conn, conn->inBuffer + conn->inStart, false);
 
 	/* Encrypt the password if needed. */
 
@@ -754,7 +781,9 @@ pg_password_sendauth(PGconn *conn, const char *password, AuthRequest areq)
 		default:
 			return STATUS_ERROR;
 	}
-	ret = pqPacketSend(conn, 'p', pwd_to_send, strlen(pwd_to_send) + 1);
+	conn->current_auth_response = AUTH_RESPONSE_PASSWORD;
+	ret = pqPacketSend(conn, PqMsg_PasswordMessage,
+					   pwd_to_send, strlen(pwd_to_send) + 1);
 	free(crypt_pwd);
 	return ret;
 }
@@ -1175,7 +1204,10 @@ pg_fe_getusername(uid_t user_id, PQExpBuffer errorMessage)
 	char		username[256 + 1];
 	DWORD		namesize = sizeof(username);
 #else
-	char		pwdbuf[BUFSIZ];
+	struct passwd pwbuf;
+	struct passwd *pw = NULL;
+	char		buf[1024];
+	int			rc;
 #endif
 
 #ifdef WIN32
@@ -1186,10 +1218,20 @@ pg_fe_getusername(uid_t user_id, PQExpBuffer errorMessage)
 						   "user name lookup failure: error code %lu",
 						   GetLastError());
 #else
-	if (pg_get_user_name(user_id, pwdbuf, sizeof(pwdbuf)))
-		name = pwdbuf;
-	else if (errorMessage)
-		appendPQExpBuffer(errorMessage, "%s\n", pwdbuf);
+	rc = getpwuid_r(user_id, &pwbuf, buf, sizeof buf, &pw);
+	if (rc != 0)
+	{
+		errno = rc;
+		if (errorMessage)
+			libpq_append_error(errorMessage, "could not look up local user ID %ld: %m", (long) user_id);
+	}
+	else if (!pw)
+	{
+		if (errorMessage)
+			libpq_append_error(errorMessage, "local user with ID %ld does not exist", (long) user_id);
+	}
+	else
+		name = pw->pw_name;
 #endif
 
 	if (name)
@@ -1313,7 +1355,7 @@ PQencryptPasswordConn(PGconn *conn, const char *passwd, const char *user,
 		if (strlen(val) > MAX_ALGORITHM_NAME_LEN)
 		{
 			PQclear(res);
-			libpq_append_conn_error(conn, "password_encryption value too long");
+			libpq_append_conn_error(conn, "\"password_encryption\" value too long");
 			return NULL;
 		}
 		strcpy(algobuf, val);

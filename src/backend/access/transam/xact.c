@@ -38,6 +38,7 @@
 #include "commands/async.h"
 #include "commands/tablecmds.h"
 #include "commands/trigger.h"
+#include "commands/waitlsn.h"
 #include "common/pg_prng.h"
 #include "executor/spi.h"
 #include "libpq/be-fsstubs.h"
@@ -200,6 +201,7 @@ typedef struct TransactionStateData
 	int			gucNestLevel;	/* GUC context nesting depth */
 	MemoryContext curTransactionContext;	/* my xact-lifetime context */
 	ResourceOwner curTransactionOwner;	/* my query resources */
+	MemoryContext priorContext; /* CurrentMemoryContext before xact started */
 	TransactionId *childXids;	/* subcommitted child XIDs, in XID order */
 	int			nChildXids;		/* # of subcommitted child XIDs */
 	int			maxChildXids;	/* allocated size of childXids[] */
@@ -346,8 +348,8 @@ static void CommitTransaction(void);
 static TransactionId RecordTransactionAbort(bool isSubXact);
 static void StartTransaction(void);
 
-static void CommitTransactionCommandInternal(void);
-static void AbortCurrentTransactionInternal(void);
+static bool CommitTransactionCommandInternal(void);
+static bool AbortCurrentTransactionInternal(void);
 
 static void StartSubTransaction(void);
 static void CommitSubTransaction(void);
@@ -646,7 +648,7 @@ AssignTransactionId(TransactionState s)
 	if (IsInParallelMode() || IsParallelWorker())
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				 errmsg("cannot assign XIDs during a parallel operation")));
+				 errmsg("cannot assign transaction IDs during a parallel operation")));
 
 	/*
 	 * Ensure parent(s) have XIDs, so that a child always has an XID later
@@ -1175,6 +1177,11 @@ AtStart_Memory(void)
 	TransactionState s = CurrentTransactionState;
 
 	/*
+	 * Remember the memory context that was active prior to transaction start.
+	 */
+	s->priorContext = CurrentMemoryContext;
+
+	/*
 	 * If this is the first time through, create a private context for
 	 * AbortTransaction to work in.  By reserving some space now, we can
 	 * insulate AbortTransaction from out-of-memory scenarios.  Like
@@ -1190,17 +1197,15 @@ AtStart_Memory(void)
 								  32 * 1024);
 
 	/*
-	 * We shouldn't have a transaction context already.
+	 * Likewise, if this is the first time through, create a top-level context
+	 * for transaction-local data.  This context will be reset at transaction
+	 * end, and then re-used in later transactions.
 	 */
-	Assert(TopTransactionContext == NULL);
-
-	/*
-	 * Create a toplevel context for the transaction.
-	 */
-	TopTransactionContext =
-		AllocSetContextCreate(TopMemoryContext,
-							  "TopTransactionContext",
-							  ALLOCSET_DEFAULT_SIZES);
+	if (TopTransactionContext == NULL)
+		TopTransactionContext =
+			AllocSetContextCreate(TopMemoryContext,
+								  "TopTransactionContext",
+								  ALLOCSET_DEFAULT_SIZES);
 
 	/*
 	 * In a top-level transaction, CurTransactionContext is the same as
@@ -1250,6 +1255,11 @@ AtSubStart_Memory(void)
 	TransactionState s = CurrentTransactionState;
 
 	Assert(CurTransactionContext != NULL);
+
+	/*
+	 * Remember the context that was active prior to subtransaction start.
+	 */
+	s->priorContext = CurrentMemoryContext;
 
 	/*
 	 * Create a CurTransactionContext, which will be used to hold data that
@@ -1576,20 +1586,30 @@ AtCCI_LocalCache(void)
 static void
 AtCommit_Memory(void)
 {
-	/*
-	 * Now that we're "out" of a transaction, have the system allocate things
-	 * in the top memory context instead of per-transaction contexts.
-	 */
-	MemoryContextSwitchTo(TopMemoryContext);
+	TransactionState s = CurrentTransactionState;
 
 	/*
-	 * Release all transaction-local memory.
+	 * Return to the memory context that was current before we started the
+	 * transaction.  (In principle, this could not be any of the contexts we
+	 * are about to delete.  If it somehow is, assertions in mcxt.c will
+	 * complain.)
+	 */
+	MemoryContextSwitchTo(s->priorContext);
+
+	/*
+	 * Release all transaction-local memory.  TopTransactionContext survives
+	 * but becomes empty; any sub-contexts go away.
 	 */
 	Assert(TopTransactionContext != NULL);
-	MemoryContextDelete(TopTransactionContext);
-	TopTransactionContext = NULL;
+	MemoryContextReset(TopTransactionContext);
+
+	/*
+	 * Clear these pointers as a pro-forma matter.  (Notionally, while
+	 * TopTransactionContext still exists, it's currently not associated with
+	 * this TransactionState struct.)
+	 */
 	CurTransactionContext = NULL;
-	CurrentTransactionState->curTransactionContext = NULL;
+	s->curTransactionContext = NULL;
 }
 
 /* ----------------------------------------------------------------
@@ -1942,13 +1962,18 @@ AtSubAbort_childXids(void)
 static void
 AtCleanup_Memory(void)
 {
-	Assert(CurrentTransactionState->parent == NULL);
+	TransactionState s = CurrentTransactionState;
+
+	/* Should be at top level */
+	Assert(s->parent == NULL);
 
 	/*
-	 * Now that we're "out" of a transaction, have the system allocate things
-	 * in the top memory context instead of per-transaction contexts.
+	 * Return to the memory context that was current before we started the
+	 * transaction.  (In principle, this could not be any of the contexts we
+	 * are about to delete.  If it somehow is, assertions in mcxt.c will
+	 * complain.)
 	 */
-	MemoryContextSwitchTo(TopMemoryContext);
+	MemoryContextSwitchTo(s->priorContext);
 
 	/*
 	 * Clear the special abort context for next time.
@@ -1957,13 +1982,20 @@ AtCleanup_Memory(void)
 		MemoryContextReset(TransactionAbortContext);
 
 	/*
-	 * Release all transaction-local memory.
+	 * Release all transaction-local memory, the same as in AtCommit_Memory,
+	 * except we must cope with the possibility that we didn't get as far as
+	 * creating TopTransactionContext.
 	 */
 	if (TopTransactionContext != NULL)
-		MemoryContextDelete(TopTransactionContext);
-	TopTransactionContext = NULL;
+		MemoryContextReset(TopTransactionContext);
+
+	/*
+	 * Clear these pointers as a pro-forma matter.  (Notionally, while
+	 * TopTransactionContext still exists, it's currently not associated with
+	 * this TransactionState struct.)
+	 */
 	CurTransactionContext = NULL;
-	CurrentTransactionState->curTransactionContext = NULL;
+	s->curTransactionContext = NULL;
 }
 
 
@@ -1982,8 +2014,15 @@ AtSubCleanup_Memory(void)
 
 	Assert(s->parent != NULL);
 
-	/* Make sure we're not in an about-to-be-deleted context */
-	MemoryContextSwitchTo(s->parent->curTransactionContext);
+	/*
+	 * Return to the memory context that was current before we started the
+	 * subtransaction.  (In principle, this could not be any of the contexts
+	 * we are about to delete.  If it somehow is, assertions in mcxt.c will
+	 * complain.)
+	 */
+	MemoryContextSwitchTo(s->priorContext);
+
+	/* Update CurTransactionContext (might not be same as priorContext) */
 	CurTransactionContext = s->parent->curTransactionContext;
 
 	/*
@@ -2771,6 +2810,11 @@ AbortTransaction(void)
 	 */
 	LWLockReleaseAll();
 
+	/*
+	 * Cleanup waiting for LSN if any.
+	 */
+	WaitLSNCleanup();
+
 	/* Clear wait information and command progress indicator */
 	pgstat_report_wait_end();
 	pgstat_progress_end_command();
@@ -3092,49 +3136,26 @@ RestoreTransactionCharacteristics(const SavedTransactionCharacteristics *s)
 void
 CommitTransactionCommand(void)
 {
-	while (true)
+	/*
+	 * Repeatedly call CommitTransactionCommandInternal() until all the work
+	 * is done.
+	 */
+	while (!CommitTransactionCommandInternal())
 	{
-		switch (CurrentTransactionState->blockState)
-		{
-				/*
-				 * The current already-failed subtransaction is ending due to
-				 * a ROLLBACK or ROLLBACK TO command, so pop it and
-				 * recursively examine the parent (which could be in any of
-				 * several states).
-				 */
-			case TBLOCK_SUBABORT_END:
-				CleanupSubTransaction();
-				continue;
-
-				/*
-				 * As above, but it's not dead yet, so abort first.
-				 */
-			case TBLOCK_SUBABORT_PENDING:
-				AbortSubTransaction();
-				CleanupSubTransaction();
-				continue;
-			default:
-				break;
-		}
-		CommitTransactionCommandInternal();
-		break;
 	}
 }
 
 /*
- *	CommitTransactionCommandInternal - a function doing all the material work
- *		regarding handling the commit transaction command except for loop over
- *		subtransactions.
+ *	CommitTransactionCommandInternal - a function doing an iteration of work
+ *		regarding handling the commit transaction command.  In the case of
+ *		subtransactions more than one iterations could be required.  Returns
+ *		true when no more iterations required, false otherwise.
  */
-static void
+static bool
 CommitTransactionCommandInternal(void)
 {
 	TransactionState s = CurrentTransactionState;
 	SavedTransactionCharacteristics savetc;
-
-	/* This states are handled in CommitTransactionCommand() */
-	Assert(s->blockState != TBLOCK_SUBABORT_END &&
-		   s->blockState != TBLOCK_SUBABORT_PENDING);
 
 	/* Must save in case we need to restore below */
 	SaveTransactionCharacteristics(&savetc);
@@ -3320,6 +3341,25 @@ CommitTransactionCommandInternal(void)
 			break;
 
 			/*
+			 * The current already-failed subtransaction is ending due to a
+			 * ROLLBACK or ROLLBACK TO command, so pop it and recursively
+			 * examine the parent (which could be in any of several states).
+			 * As we need to examine the parent, return false to request the
+			 * caller to do the next iteration.
+			 */
+		case TBLOCK_SUBABORT_END:
+			CleanupSubTransaction();
+			return false;
+
+			/*
+			 * As above, but it's not dead yet, so abort first.
+			 */
+		case TBLOCK_SUBABORT_PENDING:
+			AbortSubTransaction();
+			CleanupSubTransaction();
+			return false;
+
+			/*
 			 * The current subtransaction is the target of a ROLLBACK TO
 			 * command.  Abort and pop it, then start a new subtransaction
 			 * with the same name.
@@ -3376,10 +3416,10 @@ CommitTransactionCommandInternal(void)
 				s->blockState = TBLOCK_SUBINPROGRESS;
 			}
 			break;
-		default:
-			/* Keep compiler quiet */
-			break;
 	}
+
+	/* Done, no more iterations required */
+	return true;
 }
 
 /*
@@ -3390,58 +3430,25 @@ CommitTransactionCommandInternal(void)
 void
 AbortCurrentTransaction(void)
 {
-	while (true)
+	/*
+	 * Repeatedly call AbortCurrentTransactionInternal() until all the work is
+	 * done.
+	 */
+	while (!AbortCurrentTransactionInternal())
 	{
-		switch (CurrentTransactionState->blockState)
-		{
-				/*
-				 * If we failed while trying to create a subtransaction, clean
-				 * up the broken subtransaction and abort the parent.  The
-				 * same applies if we get a failure while ending a
-				 * subtransaction.
-				 */
-			case TBLOCK_SUBBEGIN:
-			case TBLOCK_SUBRELEASE:
-			case TBLOCK_SUBCOMMIT:
-			case TBLOCK_SUBABORT_PENDING:
-			case TBLOCK_SUBRESTART:
-				AbortSubTransaction();
-				CleanupSubTransaction();
-				continue;
-
-				/*
-				 * Same as above, except the Abort() was already done.
-				 */
-			case TBLOCK_SUBABORT_END:
-			case TBLOCK_SUBABORT_RESTART:
-				CleanupSubTransaction();
-				continue;
-			default:
-				break;
-		}
-		AbortCurrentTransactionInternal();
-		break;
 	}
 }
 
 /*
- *	AbortCurrentTransactionInternal - a function doing all the material work
- *		regarding handling the abort transaction command except for loop over
- *		subtransactions.
+ *	AbortCurrentTransactionInternal - a function doing an iteration of work
+ *		regarding handling the current transaction abort.  In the case of
+ *		subtransactions more than one iterations could be required.  Returns
+ *		true when no more iterations required, false otherwise.
  */
-static void
+static bool
 AbortCurrentTransactionInternal(void)
 {
 	TransactionState s = CurrentTransactionState;
-
-	/* This states are handled in AbortCurrentTransaction() */
-	Assert(s->blockState != TBLOCK_SUBBEGIN &&
-		   s->blockState != TBLOCK_SUBRELEASE &&
-		   s->blockState != TBLOCK_SUBCOMMIT &&
-		   s->blockState != TBLOCK_SUBABORT_PENDING &&
-		   s->blockState != TBLOCK_SUBRESTART &&
-		   s->blockState != TBLOCK_SUBABORT_END &&
-		   s->blockState != TBLOCK_SUBABORT_RESTART);
 
 	switch (s->blockState)
 	{
@@ -3563,10 +3570,34 @@ AbortCurrentTransactionInternal(void)
 			AbortSubTransaction();
 			s->blockState = TBLOCK_SUBABORT;
 			break;
-		default:
-			/* Keep compiler quiet */
-			break;
+
+			/*
+			 * If we failed while trying to create a subtransaction, clean up
+			 * the broken subtransaction and abort the parent.  The same
+			 * applies if we get a failure while ending a subtransaction.  As
+			 * we need to abort the parent, return false to request the caller
+			 * to do the next iteration.
+			 */
+		case TBLOCK_SUBBEGIN:
+		case TBLOCK_SUBRELEASE:
+		case TBLOCK_SUBCOMMIT:
+		case TBLOCK_SUBABORT_PENDING:
+		case TBLOCK_SUBRESTART:
+			AbortSubTransaction();
+			CleanupSubTransaction();
+			return false;
+
+			/*
+			 * Same as above, except the Abort() was already done.
+			 */
+		case TBLOCK_SUBABORT_END:
+		case TBLOCK_SUBABORT_RESTART:
+			CleanupSubTransaction();
+			return false;
 	}
+
+	/* Done, no more iterations required */
+	return true;
 }
 
 /*
@@ -4917,8 +4948,13 @@ AbortOutOfAnyTransaction(void)
 	/* Should be out of all subxacts now */
 	Assert(s->parent == NULL);
 
-	/* If we didn't actually have anything to do, revert to TopMemoryContext */
-	AtCleanup_Memory();
+	/*
+	 * Revert to TopMemoryContext, to ensure we exit in a well-defined state
+	 * whether there were any transactions to close or not.  (Callers that
+	 * don't intend to exit soon should switch to some other context to avoid
+	 * long-term memory leaks.)
+	 */
+	MemoryContextSwitchTo(TopMemoryContext);
 }
 
 /*
@@ -5292,20 +5328,7 @@ AbortSubTransaction(void)
 
 		AtEOSubXact_RelationCache(false, s->subTransactionId,
 								  s->parent->subTransactionId);
-
-
-		/*
-		 * AtEOSubXact_Inval sometimes needs to temporarily bump the refcount
-		 * on the relcache entries that it processes.  We cannot use the
-		 * subtransaction's resource owner anymore, because we've already
-		 * started releasing it.  But we can use the parent resource owner.
-		 */
-		CurrentResourceOwner = s->parent->curTransactionOwner;
-
 		AtEOSubXact_Inval(false);
-
-		CurrentResourceOwner = s->curTransactionOwner;
-
 		ResourceOwnerRelease(s->curTransactionOwner,
 							 RESOURCE_RELEASE_LOCKS,
 							 false, false);
@@ -5928,7 +5951,7 @@ XactLogCommitRecord(TimestampTz commit_time,
 	{
 		XLogRegisterData((char *) (&xl_twophase), sizeof(xl_xact_twophase));
 		if (xl_xinfo.xinfo & XACT_XINFO_HAS_GID)
-			XLogRegisterData(unconstify(char *, twophase_gid), strlen(twophase_gid) + 1);
+			XLogRegisterData(twophase_gid, strlen(twophase_gid) + 1);
 	}
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)
@@ -6074,7 +6097,7 @@ XactLogAbortRecord(TimestampTz abort_time,
 	{
 		XLogRegisterData((char *) (&xl_twophase), sizeof(xl_xact_twophase));
 		if (xl_xinfo.xinfo & XACT_XINFO_HAS_GID)
-			XLogRegisterData(unconstify(char *, twophase_gid), strlen(twophase_gid) + 1);
+			XLogRegisterData(twophase_gid, strlen(twophase_gid) + 1);
 	}
 
 	if (xl_xinfo.xinfo & XACT_XINFO_HAS_ORIGIN)

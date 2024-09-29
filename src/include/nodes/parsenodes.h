@@ -154,12 +154,14 @@ typedef struct Query
 	bool		hasDistinctOn pg_node_attr(query_jumble_ignore);
 	/* WITH RECURSIVE was specified */
 	bool		hasRecursive pg_node_attr(query_jumble_ignore);
-	/* has INSERT/UPDATE/DELETE in WITH */
+	/* has INSERT/UPDATE/DELETE/MERGE in WITH */
 	bool		hasModifyingCTE pg_node_attr(query_jumble_ignore);
 	/* FOR [KEY] UPDATE/SHARE was specified */
 	bool		hasForUpdate pg_node_attr(query_jumble_ignore);
 	/* rewriter has applied some RLS policy */
 	bool		hasRowSecurity pg_node_attr(query_jumble_ignore);
+	/* parser has added an RTE_GROUP RTE */
+	bool		hasGroupRTE pg_node_attr(query_jumble_ignore);
 	/* is a RETURN statement */
 	bool		isReturn pg_node_attr(query_jumble_ignore);
 
@@ -938,17 +940,6 @@ typedef struct PartitionRangeDatum
 } PartitionRangeDatum;
 
 /*
- * PartitionDesc - info about single partition for ALTER TABLE SPLIT PARTITION command
- */
-typedef struct SinglePartitionSpec
-{
-	NodeTag		type;
-
-	RangeVar   *name;			/* name of partition */
-	PartitionBoundSpec *bound;	/* FOR VALUES, if attaching */
-} SinglePartitionSpec;
-
-/*
  * PartitionCmd - info for ALTER TABLE/INDEX ATTACH/DETACH PARTITION commands
  */
 typedef struct PartitionCmd
@@ -956,8 +947,6 @@ typedef struct PartitionCmd
 	NodeTag		type;
 	RangeVar   *name;			/* name of partition to attach/detach */
 	PartitionBoundSpec *bound;	/* FOR VALUES, if attaching */
-	List	   *partlist;		/* list of partitions, for MERGE/SPLIT
-								 * PARTITION command */
 	bool		concurrent;
 } PartitionCmd;
 
@@ -1036,6 +1025,7 @@ typedef enum RTEKind
 	RTE_RESULT,					/* RTE represents an empty FROM clause; such
 								 * RTEs are added by the planner, they're not
 								 * present during parsing or rewriting */
+	RTE_GROUP,					/* the grouping step */
 } RTEKind;
 
 typedef struct RangeTblEntry
@@ -1241,6 +1231,12 @@ typedef struct RangeTblEntry
 	char	   *enrname;
 	/* estimated or actual from caller */
 	Cardinality enrtuples pg_node_attr(query_jumble_ignore);
+
+	/*
+	 * Fields valid for a GROUP RTE (else NIL):
+	 */
+	/* list of grouping expressions */
+	List	   *groupexprs pg_node_attr(query_jumble_ignore);
 
 	/*
 	 * Fields valid in all RTEs:
@@ -1549,8 +1545,6 @@ typedef struct WindowClause
 	int			frameOptions;	/* frame_clause options, see WindowDef */
 	Node	   *startOffset;	/* expression for starting bound, if any */
 	Node	   *endOffset;		/* expression for ending bound, if any */
-	/* qual to help short-circuit execution */
-	List	   *runCondition pg_node_attr(query_jumble_ignore);
 	/* in_range function for startOffset */
 	Oid			startInRangeFunc pg_node_attr(query_jumble_ignore);
 	/* in_range function for endOffset */
@@ -1791,6 +1785,8 @@ typedef struct JsonFuncExpr
 {
 	NodeTag		type;
 	JsonExprOp	op;				/* expression type */
+	char	   *column_name;	/* JSON_TABLE() column name or NULL if this is
+								 * not for a JSON_TABLE() */
 	JsonValueExpr *context_item;	/* context item expression */
 	Node	   *pathspec;		/* JSON path specification expression */
 	List	   *passing;		/* list of PASSING clause arguments, if any */
@@ -1799,7 +1795,7 @@ typedef struct JsonFuncExpr
 	JsonBehavior *on_error;		/* ON ERROR behavior */
 	JsonWrapper wrapper;		/* array wrapper behavior (JSON_QUERY only) */
 	JsonQuotes	quotes;			/* omit or keep quotes? (JSON_QUERY only) */
-	int			location;		/* token location, or -1 if unknown */
+	ParseLoc	location;		/* token location, or -1 if unknown */
 } JsonFuncExpr;
 
 /*
@@ -1813,8 +1809,8 @@ typedef struct JsonTablePathSpec
 
 	Node	   *string;
 	char	   *name;
-	int			name_location;
-	int			location;		/* location of 'string' */
+	ParseLoc	name_location;
+	ParseLoc	location;		/* location of 'string' */
 } JsonTablePathSpec;
 
 /*
@@ -1831,7 +1827,7 @@ typedef struct JsonTable
 	JsonBehavior *on_error;		/* ON ERROR behavior */
 	Alias	   *alias;			/* table alias in FROM clause */
 	bool		lateral;		/* does it have LATERAL prefix? */
-	int			location;		/* token location, or -1 if unknown */
+	ParseLoc	location;		/* token location, or -1 if unknown */
 } JsonTable;
 
 /*
@@ -1864,7 +1860,7 @@ typedef struct JsonTableColumn
 	List	   *columns;		/* nested columns */
 	JsonBehavior *on_empty;		/* ON EMPTY behavior */
 	JsonBehavior *on_error;		/* ON ERROR behavior */
-	int			location;		/* token location, or -1 if unknown */
+	ParseLoc	location;		/* token location, or -1 if unknown */
 } JsonTableColumn;
 
 /*
@@ -2356,9 +2352,9 @@ typedef enum AlterTableType
 	AT_CookedColumnDefault,		/* add a pre-cooked column default */
 	AT_DropNotNull,				/* alter column drop not null */
 	AT_SetNotNull,				/* alter column set not null */
-	AT_SetAttNotNull,			/* set attnotnull w/o a constraint */
 	AT_SetExpression,			/* alter column set expression */
 	AT_DropExpression,			/* alter column drop expression */
+	AT_CheckNotNull,			/* check column is already marked not null */
 	AT_SetStatistics,			/* alter column set statistics */
 	AT_SetOptions,				/* alter column set ( options ) */
 	AT_ResetOptions,			/* alter column reset ( options ) */
@@ -2413,8 +2409,6 @@ typedef enum AlterTableType
 	AT_AttachPartition,			/* ATTACH PARTITION */
 	AT_DetachPartition,			/* DETACH PARTITION */
 	AT_DetachPartitionFinalize, /* DETACH PARTITION FINALIZE */
-	AT_SplitPartition,			/* SPLIT PARTITION */
-	AT_MergePartitions,			/* MERGE PARTITIONS */
 	AT_AddIdentity,				/* ADD IDENTITY */
 	AT_SetIdentity,				/* SET identity column options */
 	AT_DropIdentity,			/* DROP IDENTITY */
@@ -2643,10 +2637,10 @@ typedef struct VariableShowStmt
  *		Create Table Statement
  *
  * NOTE: in the raw gram.y output, ColumnDef and Constraint nodes are
- * intermixed in tableElts, and constraints and nnconstraints are NIL.  After
- * parse analysis, tableElts contains just ColumnDefs, nnconstraints contains
- * Constraint nodes of CONSTR_NOTNULL type from various sources, and
- * constraints contains just CONSTR_CHECK Constraint nodes.
+ * intermixed in tableElts, and constraints is NIL.  After parse analysis,
+ * tableElts contains just ColumnDefs, and constraints contains just
+ * Constraint nodes (in fact, only CONSTR_CHECK nodes, in the present
+ * implementation).
  * ----------------------
  */
 
@@ -2661,7 +2655,6 @@ typedef struct CreateStmt
 	PartitionSpec *partspec;	/* PARTITION BY clause */
 	TypeName   *ofTypename;		/* OF typename */
 	List	   *constraints;	/* constraints (list of Constraint nodes) */
-	List	   *nnconstraints;	/* NOT NULL constraints (ditto) */
 	List	   *options;		/* options from WITH clause */
 	OnCommitAction oncommit;	/* what do we do at COMMIT? */
 	char	   *tablespacename; /* table space to use, or NULL */
@@ -4068,7 +4061,12 @@ typedef struct DeallocateStmt
 	NodeTag		type;
 	/* The name of the plan to remove, NULL if DEALLOCATE ALL */
 	char	   *name pg_node_attr(query_jumble_ignore);
-	/* true if DEALLOCATE ALL */
+
+	/*
+	 * True if DEALLOCATE ALL.  This is redundant with "name == NULL", but we
+	 * make it a separate field so that exactly this condition (and not the
+	 * precise name) will be accounted for in query jumbling.
+	 */
 	bool		isall;
 	/* token location, or -1 if unknown */
 	ParseLoc	location pg_node_attr(query_jumble_location);

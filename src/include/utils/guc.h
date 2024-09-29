@@ -223,6 +223,7 @@ typedef enum
 #define GUC_DISALLOW_IN_AUTO_FILE \
 							   0x002000 /* can't set in PG_AUTOCONF_FILENAME */
 #define GUC_RUNTIME_COMPUTED   0x004000 /* delay processing in 'postgres -C' */
+#define GUC_ALLOW_IN_PARALLEL  0x008000 /* allow setting in parallel mode */
 
 #define GUC_UNIT_KB			 0x01000000 /* value is in kilobytes */
 #define GUC_UNIT_BLOCKS		 0x02000000 /* value is in blocks */
@@ -245,11 +246,18 @@ extern PGDLLIMPORT bool Debug_print_parse;
 extern PGDLLIMPORT bool Debug_print_rewritten;
 extern PGDLLIMPORT bool Debug_pretty_print;
 
+#ifdef DEBUG_NODE_TESTS_ENABLED
+extern PGDLLIMPORT bool Debug_copy_parse_plan_trees;
+extern PGDLLIMPORT bool Debug_write_read_parse_plan_trees;
+extern PGDLLIMPORT bool Debug_raw_expression_coverage_test;
+#endif
+
 extern PGDLLIMPORT bool log_parser_stats;
 extern PGDLLIMPORT bool log_planner_stats;
 extern PGDLLIMPORT bool log_executor_stats;
 extern PGDLLIMPORT bool log_statement_stats;
 extern PGDLLIMPORT bool log_btree_build_stats;
+extern PGDLLIMPORT char *event_source;
 
 extern PGDLLIMPORT bool check_function_bodies;
 extern PGDLLIMPORT bool current_role_is_superuser;
@@ -267,7 +275,6 @@ extern PGDLLIMPORT int log_temp_files;
 extern PGDLLIMPORT double log_statement_sample_rate;
 extern PGDLLIMPORT double log_xact_sample_rate;
 extern PGDLLIMPORT char *backtrace_functions;
-extern PGDLLIMPORT bool backtrace_on_internal_error;
 
 extern PGDLLIMPORT int temp_file_limit;
 
@@ -286,9 +293,30 @@ extern PGDLLIMPORT int tcp_keepalives_interval;
 extern PGDLLIMPORT int tcp_keepalives_count;
 extern PGDLLIMPORT int tcp_user_timeout;
 
-#ifdef TRACE_SORT
+extern PGDLLIMPORT char *role_string;
+extern PGDLLIMPORT bool in_hot_standby_guc;
 extern PGDLLIMPORT bool trace_sort;
+
+#ifdef DEBUG_BOUNDED_SORT
+extern PGDLLIMPORT bool optimize_bounded_sort;
 #endif
+
+/*
+ * Declarations for options for enum values
+ *
+ * For most parameters, these are defined statically inside guc_tables.c.  But
+ * for some parameters, the definitions require symbols that are not easily
+ * available inside guc_tables.c, so they are instead defined in their home
+ * modules.  For those, we keep the extern declarations here.  (An alternative
+ * would be to put the extern declarations in the modules' header files, but
+ * that would then require including the definition of struct
+ * config_enum_entry into those header files.)
+ */
+extern PGDLLIMPORT const struct config_enum_entry archive_mode_options[];
+extern PGDLLIMPORT const struct config_enum_entry dynamic_shared_memory_options[];
+extern PGDLLIMPORT const struct config_enum_entry recovery_target_action_options[];
+extern PGDLLIMPORT const struct config_enum_entry wal_level_options[];
+extern PGDLLIMPORT const struct config_enum_entry wal_sync_method_options[];
 
 /*
  * Functions exported by guc.c
@@ -403,8 +431,8 @@ extern void AlterSystemSetConfigFile(AlterSystemStmt *altersysstmt);
 extern char *GetConfigOptionByName(const char *name, const char **varname,
 								   bool missing_ok);
 
-extern void TransformGUCArray(ArrayType *array, List **configNames,
-							  List **configValues);
+extern void TransformGUCArray(ArrayType *array, List **names,
+							  List **values);
 extern void ProcessGUCArray(ArrayType *array,
 							GucContext context, GucSource source, GucAction action);
 extern ArrayType *GUCArrayAdd(ArrayType *array, const char *name, const char *value);

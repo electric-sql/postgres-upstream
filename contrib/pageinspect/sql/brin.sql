@@ -62,15 +62,9 @@ CREATE TABLE brin_parallel_test (a int, b text, c bigint) WITH (fillfactor=40);
 -- for the different opclasses we build later).
 INSERT INTO brin_parallel_test
 SELECT (CASE WHEN (mod(i,231) = 0) OR (i BETWEEN 3500 AND 4000) THEN NULL ELSE i END),
-       (CASE WHEN (mod(i,233) = 0) OR (i BETWEEN 3750 AND 4250) THEN NULL ELSE md5(i::text) END),
+       (CASE WHEN (mod(i,233) = 0) OR (i BETWEEN 3750 AND 4250) THEN NULL ELSE encode(sha256(i::text::bytea), 'hex') END),
        (CASE WHEN (mod(i,233) = 0) OR (i BETWEEN 3850 AND 4500) THEN NULL ELSE (i/100) + mod(i,8) END)
   FROM generate_series(1,5000) S(i);
-
--- Delete a couple pages, to make the ranges empty.
-DELETE FROM brin_parallel_test WHERE a BETWEEN 1000 and 1500;
-
--- Vacuum to remove the tuples and make the ranges actually empty.
-VACUUM brin_parallel_test;
 
 -- Build an index with different opclasses - minmax, bloom and minmax-multi.
 --
@@ -87,7 +81,8 @@ VACUUM brin_parallel_test;
 SET max_parallel_maintenance_workers = 0;
 CREATE INDEX brin_test_serial_idx ON brin_parallel_test
  USING brin (a int4_minmax_ops, a int4_bloom_ops, b, c int8_minmax_multi_ops)
-  WITH (pages_per_range=7);
+  WITH (pages_per_range=7)
+ WHERE NOT (a BETWEEN 1000 and 1500);
 
 -- build index using parallelism
 --
@@ -100,7 +95,8 @@ SET max_parallel_maintenance_workers = 4;
 SET maintenance_work_mem = '128MB';
 CREATE INDEX brin_test_parallel_idx ON brin_parallel_test
  USING brin (a int4_minmax_ops, a int4_bloom_ops, b, c int8_minmax_multi_ops)
-  WITH (pages_per_range=7);
+  WITH (pages_per_range=7)
+ WHERE NOT (a BETWEEN 1000 and 1500);
 
 SELECT relname, relpages
   FROM pg_class
@@ -126,7 +122,8 @@ DROP INDEX brin_test_parallel_idx;
 SET max_parallel_workers = 0;
 CREATE INDEX brin_test_parallel_idx ON brin_parallel_test
  USING brin (a int4_minmax_ops, a int4_bloom_ops, b, c int8_minmax_multi_ops)
-  WITH (pages_per_range=7);
+  WITH (pages_per_range=7)
+ WHERE NOT (a BETWEEN 1000 and 1500);
 
 SELECT relname, relpages
   FROM pg_class

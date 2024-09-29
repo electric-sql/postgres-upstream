@@ -36,6 +36,7 @@
 #include "port.h"
 #include "postmaster/syslogger.h"
 #include "postmaster/walsummarizer.h"
+#include "replication/slot.h"
 #include "replication/walsender.h"
 #include "replication/walsender_private.h"
 #include "storage/bufpage.h"
@@ -161,7 +162,7 @@ static const char *const excludeDirContents[] =
 	 * even if the intention is to restore to another primary. See backup.sgml
 	 * for a more detailed description.
 	 */
-	"pg_replslot",
+	PG_REPLSLOT_DIR,
 
 	/* Contents removed on startup, see dsm_cleanup_for_mmap(). */
 	PG_DYNSHMEM_DIR,
@@ -1487,7 +1488,7 @@ sendDir(bbsink *sink, const char *path, int basepathlen, bool sizeonly,
 				if (OidIsValid(spcoid))
 				{
 					relspcoid = spcoid;
-					lookup_path = psprintf("pg_tblspc/%u/%s", spcoid,
+					lookup_path = psprintf("%s/%u/%s", PG_TBLSPC_DIR, spcoid,
 										   tarfilename);
 				}
 				else
@@ -2045,12 +2046,14 @@ _tarWriteHeader(bbsink *sink, const char *filename, const char *linktarget,
 				break;
 			case TAR_NAME_TOO_LONG:
 				ereport(ERROR,
-						(errmsg("file name too long for tar format: \"%s\"",
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("file name too long for tar format: \"%s\"",
 								filename)));
 				break;
 			case TAR_SYMLINK_TOO_LONG:
 				ereport(ERROR,
-						(errmsg("symbolic link target too long for tar format: "
+						(errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
+						 errmsg("symbolic link target too long for tar format: "
 								"file name \"%s\", target \"%s\"",
 								filename, linktarget)));
 				break;

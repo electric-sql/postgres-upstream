@@ -11,9 +11,11 @@
 #ifndef PGSTAT_H
 #define PGSTAT_H
 
+#include "access/xlogdefs.h"
 #include "datatype/timestamp.h"
 #include "portability/instr_time.h"
 #include "postmaster/pgarch.h"	/* for MAX_XFN_CHARS */
+#include "replication/conflict.h"
 #include "utils/backend_progress.h" /* for backward compatibility */
 #include "utils/backend_status.h"	/* for backward compatibility */
 #include "utils/relcache.h"
@@ -32,30 +34,59 @@
 #define PG_STAT_TMP_DIR		"pg_stat_tmp"
 
 /* The types of statistics entries */
-typedef enum PgStat_Kind
+#define PgStat_Kind uint32
+
+/* Range of IDs allowed, for built-in and custom kinds */
+#define PGSTAT_KIND_MIN	1		/* Minimum ID allowed */
+#define PGSTAT_KIND_MAX	256		/* Maximum ID allowed */
+
+/* use 0 for INVALID, to catch zero-initialized data */
+#define PGSTAT_KIND_INVALID 0
+
+/* stats for variable-numbered objects */
+#define PGSTAT_KIND_DATABASE	1	/* database-wide statistics */
+#define PGSTAT_KIND_RELATION	2	/* per-table statistics */
+#define PGSTAT_KIND_FUNCTION	3	/* per-function statistics */
+#define PGSTAT_KIND_REPLSLOT	4	/* per-slot statistics */
+#define PGSTAT_KIND_SUBSCRIPTION	5	/* per-subscription statistics */
+
+/* stats for fixed-numbered objects */
+#define PGSTAT_KIND_ARCHIVER	6
+#define PGSTAT_KIND_BGWRITER	7
+#define PGSTAT_KIND_CHECKPOINTER	8
+#define PGSTAT_KIND_IO	9
+#define PGSTAT_KIND_SLRU	10
+#define PGSTAT_KIND_WAL	11
+
+#define PGSTAT_KIND_BUILTIN_MIN PGSTAT_KIND_DATABASE
+#define PGSTAT_KIND_BUILTIN_MAX PGSTAT_KIND_WAL
+#define PGSTAT_KIND_BUILTIN_SIZE (PGSTAT_KIND_BUILTIN_MAX + 1)
+
+/* Custom stats kinds */
+
+/* Range of IDs allowed for custom stats kinds */
+#define PGSTAT_KIND_CUSTOM_MIN	128
+#define PGSTAT_KIND_CUSTOM_MAX	PGSTAT_KIND_MAX
+#define PGSTAT_KIND_CUSTOM_SIZE	(PGSTAT_KIND_CUSTOM_MAX - PGSTAT_KIND_CUSTOM_MIN + 1)
+
+/*
+ * PgStat_Kind to use for extensions that require an ID, but are still in
+ * development and have not reserved their own unique kind ID yet. See:
+ * https://wiki.postgresql.org/wiki/CustomCumulativeStats
+ */
+#define PGSTAT_KIND_EXPERIMENTAL	128
+
+static inline bool
+pgstat_is_kind_builtin(PgStat_Kind kind)
 {
-	/* use 0 for INVALID, to catch zero-initialized data */
-	PGSTAT_KIND_INVALID = 0,
+	return kind >= PGSTAT_KIND_BUILTIN_MIN && kind <= PGSTAT_KIND_BUILTIN_MAX;
+}
 
-	/* stats for variable-numbered objects */
-	PGSTAT_KIND_DATABASE,		/* database-wide statistics */
-	PGSTAT_KIND_RELATION,		/* per-table statistics */
-	PGSTAT_KIND_FUNCTION,		/* per-function statistics */
-	PGSTAT_KIND_REPLSLOT,		/* per-slot statistics */
-	PGSTAT_KIND_SUBSCRIPTION,	/* per-subscription statistics */
-
-	/* stats for fixed-numbered objects */
-	PGSTAT_KIND_ARCHIVER,
-	PGSTAT_KIND_BGWRITER,
-	PGSTAT_KIND_CHECKPOINTER,
-	PGSTAT_KIND_IO,
-	PGSTAT_KIND_SLRU,
-	PGSTAT_KIND_WAL,
-} PgStat_Kind;
-
-#define PGSTAT_KIND_FIRST_VALID PGSTAT_KIND_DATABASE
-#define PGSTAT_KIND_LAST PGSTAT_KIND_WAL
-#define PGSTAT_NUM_KINDS (PGSTAT_KIND_LAST + 1)
+static inline bool
+pgstat_is_kind_custom(PgStat_Kind kind)
+{
+	return kind >= PGSTAT_KIND_CUSTOM_MIN && kind <= PGSTAT_KIND_CUSTOM_MAX;
+}
 
 /* Values for track_functions GUC variable --- order is significant! */
 typedef enum TrackFunctionsLevel
@@ -135,6 +166,7 @@ typedef struct PgStat_BackendSubEntry
 {
 	PgStat_Counter apply_error_count;
 	PgStat_Counter sync_error_count;
+	PgStat_Counter conflict_count[CONFLICT_NUM_TYPES];
 } PgStat_BackendSubEntry;
 
 /* ----------
@@ -235,7 +267,7 @@ typedef struct PgStat_TableXactStatus
  * ------------------------------------------------------------
  */
 
-#define PGSTAT_FILE_FORMAT_ID	0x01A5BCAC
+#define PGSTAT_FILE_FORMAT_ID	0x01A5BCAF
 
 typedef struct PgStat_ArchiverStats
 {
@@ -393,6 +425,7 @@ typedef struct PgStat_StatSubEntry
 {
 	PgStat_Counter apply_error_count;
 	PgStat_Counter sync_error_count;
+	PgStat_Counter conflict_count[CONFLICT_NUM_TYPES];
 	TimestampTz stat_reset_timestamp;
 } PgStat_StatSubEntry;
 
@@ -466,7 +499,7 @@ extern Size StatsShmemSize(void);
 extern void StatsShmemInit(void);
 
 /* Functions called during server startup / shutdown */
-extern void pgstat_restore_stats(void);
+extern void pgstat_restore_stats(XLogRecPtr redo);
 extern void pgstat_discard_stats(void);
 extern void pgstat_before_server_shutdown(int code, Datum arg);
 
@@ -478,7 +511,7 @@ extern long pgstat_report_stat(bool force);
 extern void pgstat_force_next_flush(void);
 
 extern void pgstat_reset_counters(void);
-extern void pgstat_reset(PgStat_Kind kind, Oid dboid, Oid objoid);
+extern void pgstat_reset(PgStat_Kind kind, Oid dboid, uint64 objid);
 extern void pgstat_reset_of_kind(PgStat_Kind kind);
 
 /* stats accessors */
@@ -487,7 +520,7 @@ extern TimestampTz pgstat_get_stat_snapshot_timestamp(bool *have_snapshot);
 
 /* helpers */
 extern PgStat_Kind pgstat_get_kind_from_str(char *kind_str);
-extern bool pgstat_have_entry(PgStat_Kind kind, Oid dboid, Oid objoid);
+extern bool pgstat_have_entry(PgStat_Kind kind, Oid dboid, uint64 objid);
 
 
 /*
@@ -695,6 +728,7 @@ extern PgStat_SLRUStats *pgstat_fetch_slru(void);
  */
 
 extern void pgstat_report_subscription_error(Oid subid, bool is_apply_error);
+extern void pgstat_report_subscription_conflict(Oid subid, ConflictType type);
 extern void pgstat_create_subscription(Oid subid);
 extern void pgstat_drop_subscription(Oid subid);
 extern PgStat_StatSubEntry *pgstat_fetch_stat_subscription(Oid subid);

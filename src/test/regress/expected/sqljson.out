@@ -537,6 +537,8 @@ SELECT JSON_OBJECT('a': '1', 'b': NULL, 'c': 2 ABSENT ON NULL);
  {"a" : "1", "c" : 2}
 (1 row)
 
+SELECT JSON_OBJECT(1: 1, '2': NULL, '3': 1, repeat('x', 1000): 1, 2: repeat('a', 100) WITH UNIQUE);
+ERROR:  duplicate JSON object key value: "2"
 SELECT JSON_OBJECT(1: 1, '1': NULL WITH UNIQUE);
 ERROR:  duplicate JSON object key value: "1"
 SELECT JSON_OBJECT(1: 1, '1': NULL ABSENT ON NULL WITH UNIQUE);
@@ -921,6 +923,9 @@ FROM (VALUES (1, 1), (0, NULL),(4, null), (5, null),(6, null),(2, 2)) foo(k, v);
  {"1": 1, "2": 2}
 (1 row)
 
+SELECT JSON_OBJECTAGG(mod(i,100): (i)::text FORMAT JSON WITH UNIQUE)
+FROM generate_series(0, 199) i;
+ERROR:  duplicate JSON object key value: "0"
 -- Test JSON_OBJECT deparsing
 EXPLAIN (VERBOSE, COSTS OFF)
 SELECT JSON_OBJECT('foo' : '1' FORMAT JSON, 'bar' : 'baz' RETURNING json);
@@ -1278,3 +1283,20 @@ CREATE OR REPLACE VIEW public.is_json_view AS
     '{}'::text IS JSON OBJECT WITH UNIQUE KEYS AS object
    FROM generate_series(1, 3) i(i)
 DROP VIEW is_json_view;
+-- Test implicit coercion to a fixed-length type specified in RETURNING
+SELECT JSON_SERIALIZE('{ "a" : 1 } ' RETURNING varchar(2));
+ERROR:  value too long for type character varying(2)
+SELECT JSON_OBJECT('a': JSON_OBJECT('b': 1 RETURNING varchar(2)));
+ERROR:  value too long for type character varying(2)
+SELECT JSON_ARRAY(JSON_ARRAY('{ "a" : 123 }' RETURNING varchar(2)));
+ERROR:  value too long for type character varying(2)
+SELECT JSON_ARRAYAGG(('111' || i)::bytea FORMAT JSON NULL ON NULL RETURNING varchar(2)) FROM generate_series(1,1) i;
+ERROR:  value too long for type character varying(2)
+SELECT JSON_OBJECTAGG(i: ('111' || i)::bytea FORMAT JSON WITH UNIQUE RETURNING varchar(2)) FROM generate_series(1, 1) i;
+ERROR:  value too long for type character varying(2)
+-- Now try domain over fixed-length type
+CREATE DOMAIN sqljson_char2 AS char(2) CHECK (VALUE NOT IN ('12'));
+SELECT JSON_SERIALIZE('123' RETURNING sqljson_char2);
+ERROR:  value too long for type character(2)
+SELECT JSON_SERIALIZE('12' RETURNING sqljson_char2);
+ERROR:  value for domain sqljson_char2 violates check constraint "sqljson_char2_check"

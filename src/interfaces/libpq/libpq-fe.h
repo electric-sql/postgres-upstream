@@ -21,7 +21,6 @@ extern "C"
 #endif
 
 #include <stdio.h>
-#include <time.h>
 
 /*
  * postgres_ext.h defines the backend's externally visible types,
@@ -31,14 +30,35 @@ extern "C"
 
 /*
  * These symbols may be used in compile-time #ifdef tests for the availability
- * of newer libpq features.
+ * of v14-and-newer libpq features.
  */
+/* Features added in PostgreSQL v14: */
 /* Indicates presence of PQenterPipelineMode and friends */
 #define LIBPQ_HAS_PIPELINING 1
 /* Indicates presence of PQsetTraceFlags; also new PQtrace output format */
 #define LIBPQ_HAS_TRACE_FLAGS 1
+
+/* Features added in PostgreSQL v15: */
 /* Indicates that PQsslAttribute(NULL, "library") is useful */
 #define LIBPQ_HAS_SSL_LIBRARY_DETECTION 1
+
+/* Features added in PostgreSQL v17: */
+/* Indicates presence of PGcancelConn typedef and associated routines */
+#define LIBPQ_HAS_ASYNC_CANCEL 1
+/* Indicates presence of PQchangePassword */
+#define LIBPQ_HAS_CHANGE_PASSWORD 1
+/* Indicates presence of PQsetChunkedRowsMode, PGRES_TUPLES_CHUNK */
+#define LIBPQ_HAS_CHUNK_MODE 1
+/* Indicates presence of PQclosePrepared, PQclosePortal, etc */
+#define LIBPQ_HAS_CLOSE_PREPARED 1
+/* Indicates presence of PQsendPipelineSync */
+#define LIBPQ_HAS_SEND_PIPELINE_SYNC 1
+/* Indicates presence of PQsocketPoll, PQgetCurrentTimeUSec */
+#define LIBPQ_HAS_SOCKET_POLL 1
+
+/* Features added in PostgreSQL v18: */
+/* Indicates presence of PQfullProtocolVersion */
+#define LIBPQ_HAS_FULL_PROTOCOL_VERSION 1
 
 /*
  * Option flags for PQcopyResult
@@ -201,6 +221,9 @@ typedef struct pgNotify
 	/* Fields below here are private to libpq; apps should not use 'em */
 	struct pgNotify *next;		/* list link */
 } PGnotify;
+
+/* pg_usec_time_t is like time_t, but with microsecond resolution */
+typedef pg_int64 pg_usec_time_t;
 
 /* Function types for notice-handling callbacks */
 typedef void (*PQnoticeReceiver) (void *arg, const PGresult *res);
@@ -374,6 +397,7 @@ extern PGTransactionStatusType PQtransactionStatus(const PGconn *conn);
 extern const char *PQparameterStatus(const PGconn *conn,
 									 const char *paramName);
 extern int	PQprotocolVersion(const PGconn *conn);
+extern int	PQfullProtocolVersion(const PGconn *conn);
 extern int	PQserverVersion(const PGconn *conn);
 extern char *PQerrorMessage(const PGconn *conn);
 extern int	PQsocket(const PGconn *conn);
@@ -673,7 +697,11 @@ extern int	lo_export(PGconn *conn, Oid lobjId, const char *filename);
 extern int	PQlibVersion(void);
 
 /* Poll a socket for reading and/or writing with an optional timeout */
-extern int	PQsocketPoll(int sock, int forRead, int forWrite, time_t end_time);
+extern int	PQsocketPoll(int sock, int forRead, int forWrite,
+						 pg_usec_time_t end_time);
+
+/* Get current time in the form PQsocketPoll wants */
+extern pg_usec_time_t PQgetCurrentTimeUSec(void);
 
 /* Determine length of multibyte encoded char at *s */
 extern int	PQmblen(const char *s, int encoding);

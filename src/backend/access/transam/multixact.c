@@ -89,6 +89,7 @@
 #include "storage/procarray.h"
 #include "utils/fmgrprotos.h"
 #include "utils/guc_hooks.h"
+#include "utils/injection_point.h"
 #include "utils/memutils.h"
 
 
@@ -108,11 +109,23 @@
 /* We need four bytes per offset */
 #define MULTIXACT_OFFSETS_PER_PAGE (BLCKSZ / sizeof(MultiXactOffset))
 
-#define MultiXactIdToOffsetPage(xid) \
-	((xid) / (MultiXactOffset) MULTIXACT_OFFSETS_PER_PAGE)
-#define MultiXactIdToOffsetEntry(xid) \
-	((xid) % (MultiXactOffset) MULTIXACT_OFFSETS_PER_PAGE)
-#define MultiXactIdToOffsetSegment(xid) (MultiXactIdToOffsetPage(xid) / SLRU_PAGES_PER_SEGMENT)
+static inline int64
+MultiXactIdToOffsetPage(MultiXactId multi)
+{
+	return multi / MULTIXACT_OFFSETS_PER_PAGE;
+}
+
+static inline int
+MultiXactIdToOffsetEntry(MultiXactId multi)
+{
+	return multi % MULTIXACT_OFFSETS_PER_PAGE;
+}
+
+static inline int64
+MultiXactIdToOffsetSegment(MultiXactId multi)
+{
+	return MultiXactIdToOffsetPage(multi) / SLRU_PAGES_PER_SEGMENT;
+}
 
 /*
  * The situation for members is a bit more complex: we store one byte of
@@ -156,30 +169,59 @@
 		((uint32) ((0xFFFFFFFF % MULTIXACT_MEMBERS_PER_PAGE) + 1))
 
 /* page in which a member is to be found */
-#define MXOffsetToMemberPage(xid) ((xid) / (TransactionId) MULTIXACT_MEMBERS_PER_PAGE)
-#define MXOffsetToMemberSegment(xid) (MXOffsetToMemberPage(xid) / SLRU_PAGES_PER_SEGMENT)
+static inline int64
+MXOffsetToMemberPage(MultiXactOffset offset)
+{
+	return offset / MULTIXACT_MEMBERS_PER_PAGE;
+}
+
+static inline int64
+MXOffsetToMemberSegment(MultiXactOffset offset)
+{
+	return MXOffsetToMemberPage(offset) / SLRU_PAGES_PER_SEGMENT;
+}
 
 /* Location (byte offset within page) of flag word for a given member */
-#define MXOffsetToFlagsOffset(xid) \
-	((((xid) / (TransactionId) MULTIXACT_MEMBERS_PER_MEMBERGROUP) % \
-	  (TransactionId) MULTIXACT_MEMBERGROUPS_PER_PAGE) * \
-	 (TransactionId) MULTIXACT_MEMBERGROUP_SIZE)
-#define MXOffsetToFlagsBitShift(xid) \
-	(((xid) % (TransactionId) MULTIXACT_MEMBERS_PER_MEMBERGROUP) * \
-	 MXACT_MEMBER_BITS_PER_XACT)
+static inline int
+MXOffsetToFlagsOffset(MultiXactOffset offset)
+{
+	MultiXactOffset group = offset / MULTIXACT_MEMBERS_PER_MEMBERGROUP;
+	int			grouponpg = group % MULTIXACT_MEMBERGROUPS_PER_PAGE;
+	int			byteoff = grouponpg * MULTIXACT_MEMBERGROUP_SIZE;
+
+	return byteoff;
+}
+
+static inline int
+MXOffsetToFlagsBitShift(MultiXactOffset offset)
+{
+	int			member_in_group = offset % MULTIXACT_MEMBERS_PER_MEMBERGROUP;
+	int			bshift = member_in_group * MXACT_MEMBER_BITS_PER_XACT;
+
+	return bshift;
+}
 
 /* Location (byte offset within page) of TransactionId of given member */
-#define MXOffsetToMemberOffset(xid) \
-	(MXOffsetToFlagsOffset(xid) + MULTIXACT_FLAGBYTES_PER_GROUP + \
-	 ((xid) % MULTIXACT_MEMBERS_PER_MEMBERGROUP) * sizeof(TransactionId))
+static inline int
+MXOffsetToMemberOffset(MultiXactOffset offset)
+{
+	int			member_in_group = offset % MULTIXACT_MEMBERS_PER_MEMBERGROUP;
+
+	return MXOffsetToFlagsOffset(offset) +
+		MULTIXACT_FLAGBYTES_PER_GROUP +
+		member_in_group * sizeof(TransactionId);
+}
 
 /* Multixact members wraparound thresholds. */
 #define MULTIXACT_MEMBER_SAFE_THRESHOLD		(MaxMultiXactOffset / 2)
 #define MULTIXACT_MEMBER_DANGER_THRESHOLD	\
 	(MaxMultiXactOffset - MaxMultiXactOffset / 4)
 
-#define PreviousMultiXactId(xid) \
-	((xid) == FirstMultiXactId ? MaxMultiXactId : (xid) - 1)
+static inline MultiXactId
+PreviousMultiXactId(MultiXactId multi)
+{
+	return multi == FirstMultiXactId ? MaxMultiXactId : multi - 1;
+}
 
 /*
  * Links to shared-memory data structures for MultiXact control
@@ -813,6 +855,9 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
 		}
 	}
 
+	/* Load the injection point before entering the critical section */
+	INJECTION_POINT_LOAD("multixact-create-from-members");
+
 	/*
 	 * Assign the MXID and offsets range to use, and make sure there is space
 	 * in the OFFSETs and MEMBERs files.  NB: this routine does
@@ -826,6 +871,8 @@ MultiXactIdCreateFromMembers(int nmembers, MultiXactMember *members)
 	 * keep OldestMulti set, in case it runs for long.
 	 */
 	multi = GetNewMultiXactId(nmembers, &offset);
+
+	INJECTION_POINT_CACHED("multixact-create-from-members");
 
 	/* Make an XLOG entry describing the new MXID. */
 	xlrec.mid = multi;
@@ -1151,7 +1198,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 								  MultiXactState->offsetStopLimit - nextOffset - 1,
 								  nmembers,
 								  MultiXactState->offsetStopLimit - nextOffset - 1),
-				 errhint("Execute a database-wide VACUUM in database with OID %u with reduced vacuum_multixact_freeze_min_age and vacuum_multixact_freeze_table_age settings.",
+				 errhint("Execute a database-wide VACUUM in database with OID %u with reduced \"vacuum_multixact_freeze_min_age\" and \"vacuum_multixact_freeze_table_age\" settings.",
 						 MultiXactState->oldestMultiXactDB)));
 	}
 
@@ -1187,7 +1234,7 @@ GetNewMultiXactId(int nmembers, MultiXactOffset *offset)
 							   MultiXactState->offsetStopLimit - nextOffset + nmembers,
 							   MultiXactState->oldestMultiXactDB,
 							   MultiXactState->offsetStopLimit - nextOffset + nmembers),
-				 errhint("Execute a database-wide VACUUM in that database with reduced vacuum_multixact_freeze_min_age and vacuum_multixact_freeze_table_age settings.")));
+				 errhint("Execute a database-wide VACUUM in that database with reduced \"vacuum_multixact_freeze_min_age\" and \"vacuum_multixact_freeze_table_age\" settings.")));
 
 	ExtendMultiXactMember(nextOffset, nmembers);
 
@@ -1438,6 +1485,8 @@ retry:
 			/* Corner case 2: next multixact is still being filled in */
 			LWLockRelease(lock);
 			CHECK_FOR_INTERRUPTS();
+
+			INJECTION_POINT("multixact-get-members-cv-sleep");
 
 			ConditionVariableSleep(&MultiXactState->nextoff_cv,
 								   WAIT_EVENT_MULTIXACT_CREATION);
@@ -1968,7 +2017,7 @@ check_multixact_offset_buffers(int *newval, void **extra, GucSource source)
 }
 
 /*
- * GUC check_hook for multixact_member_buffer
+ * GUC check_hook for multixact_member_buffers
  */
 bool
 check_multixact_member_buffers(int *newval, void **extra, GucSource source)
@@ -2932,6 +2981,7 @@ MultiXactMemberFreezeThreshold(void)
 	uint32		multixacts;
 	uint32		victim_multixacts;
 	double		fraction;
+	int			result;
 
 	/* If we can't determine member space utilization, assume the worst. */
 	if (!ReadMultiXactCounts(&multixacts, &members))
@@ -2953,7 +3003,13 @@ MultiXactMemberFreezeThreshold(void)
 	/* fraction could be > 1.0, but lowest possible freeze age is zero */
 	if (victim_multixacts > multixacts)
 		return 0;
-	return multixacts - victim_multixacts;
+	result = multixacts - victim_multixacts;
+
+	/*
+	 * Clamp to autovacuum_multixact_freeze_max_age, so that we never make
+	 * autovacuum less aggressive than it would otherwise be.
+	 */
+	return Min(result, autovacuum_multixact_freeze_max_age);
 }
 
 typedef struct mxtruncinfo
@@ -2991,10 +3047,10 @@ SlruScanDirCbFindEarliest(SlruCtl ctl, char *filename, int64 segpage, void *data
 static void
 PerformMembersTruncation(MultiXactOffset oldestOffset, MultiXactOffset newOldestOffset)
 {
-	const int	maxsegment = MXOffsetToMemberSegment(MaxMultiXactOffset);
-	int			startsegment = MXOffsetToMemberSegment(oldestOffset);
-	int			endsegment = MXOffsetToMemberSegment(newOldestOffset);
-	int			segment = startsegment;
+	const int64 maxsegment = MXOffsetToMemberSegment(MaxMultiXactOffset);
+	int64		startsegment = MXOffsetToMemberSegment(oldestOffset);
+	int64		endsegment = MXOffsetToMemberSegment(newOldestOffset);
+	int64		segment = startsegment;
 
 	/*
 	 * Delete all the segments but the last one. The last segment can still
@@ -3002,7 +3058,8 @@ PerformMembersTruncation(MultiXactOffset oldestOffset, MultiXactOffset newOldest
 	 */
 	while (segment != endsegment)
 	{
-		elog(DEBUG2, "truncating multixact members segment %x", segment);
+		elog(DEBUG2, "truncating multixact members segment %llx",
+			 (unsigned long long) segment);
 		SlruDeleteSegment(MultiXactMemberCtl, segment);
 
 		/* move to next segment, handling wraparound correctly */
@@ -3153,14 +3210,14 @@ TruncateMultiXact(MultiXactId newOldestMulti, Oid newOldestMultiDB)
 	}
 
 	elog(DEBUG1, "performing multixact truncation: "
-		 "offsets [%u, %u), offsets segments [%x, %x), "
-		 "members [%u, %u), members segments [%x, %x)",
+		 "offsets [%u, %u), offsets segments [%llx, %llx), "
+		 "members [%u, %u), members segments [%llx, %llx)",
 		 oldestMulti, newOldestMulti,
-		 MultiXactIdToOffsetSegment(oldestMulti),
-		 MultiXactIdToOffsetSegment(newOldestMulti),
+		 (unsigned long long) MultiXactIdToOffsetSegment(oldestMulti),
+		 (unsigned long long) MultiXactIdToOffsetSegment(newOldestMulti),
 		 oldestOffset, newOldestOffset,
-		 MXOffsetToMemberSegment(oldestOffset),
-		 MXOffsetToMemberSegment(newOldestOffset));
+		 (unsigned long long) MXOffsetToMemberSegment(oldestOffset),
+		 (unsigned long long) MXOffsetToMemberSegment(newOldestOffset));
 
 	/*
 	 * Do truncation, and the WAL logging of the truncation, in a critical
@@ -3413,14 +3470,14 @@ multixact_redo(XLogReaderState *record)
 			   SizeOfMultiXactTruncate);
 
 		elog(DEBUG1, "replaying multixact truncation: "
-			 "offsets [%u, %u), offsets segments [%x, %x), "
-			 "members [%u, %u), members segments [%x, %x)",
+			 "offsets [%u, %u), offsets segments [%llx, %llx), "
+			 "members [%u, %u), members segments [%llx, %llx)",
 			 xlrec.startTruncOff, xlrec.endTruncOff,
-			 MultiXactIdToOffsetSegment(xlrec.startTruncOff),
-			 MultiXactIdToOffsetSegment(xlrec.endTruncOff),
+			 (unsigned long long) MultiXactIdToOffsetSegment(xlrec.startTruncOff),
+			 (unsigned long long) MultiXactIdToOffsetSegment(xlrec.endTruncOff),
 			 xlrec.startTruncMemb, xlrec.endTruncMemb,
-			 MXOffsetToMemberSegment(xlrec.startTruncMemb),
-			 MXOffsetToMemberSegment(xlrec.endTruncMemb));
+			 (unsigned long long) MXOffsetToMemberSegment(xlrec.startTruncMemb),
+			 (unsigned long long) MXOffsetToMemberSegment(xlrec.endTruncMemb));
 
 		/* should not be required, but more than cheap enough */
 		LWLockAcquire(MultiXactTruncationLock, LW_EXCLUSIVE);

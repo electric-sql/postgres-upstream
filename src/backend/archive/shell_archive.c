@@ -48,7 +48,7 @@ shell_archive_configured(ArchiveModuleState *state)
 	if (XLogArchiveCommand[0] != '\0')
 		return true;
 
-	arch_module_check_errdetail("%s is not set.",
+	arch_module_check_errdetail("\"%s\" is not set.",
 								"archive_command");
 	return false;
 }
@@ -125,9 +125,11 @@ shell_archive_file(ArchiveModuleState *state, const char *file,
 					 errdetail("The failed archive command was: %s",
 							   xlogarchcmd)));
 		}
+		pfree(xlogarchcmd);
 
 		return false;
 	}
+	pfree(xlogarchcmd);
 
 	elog(DEBUG1, "archived write-ahead log file \"%s\"", file);
 	return true;

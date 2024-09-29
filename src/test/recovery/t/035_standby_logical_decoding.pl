@@ -10,10 +10,7 @@ use PostgreSQL::Test::Cluster;
 use PostgreSQL::Test::Utils;
 use Test::More;
 
-my ($stdin, $stdout, $stderr,
-	$cascading_stdout, $cascading_stderr, $subscriber_stdin,
-	$subscriber_stdout, $subscriber_stderr, $ret,
-	$handle, $slot);
+my ($stdout, $stderr, $cascading_stdout, $cascading_stderr, $handle);
 
 my $node_primary = PostgreSQL::Test::Cluster->new('primary');
 my $node_standby = PostgreSQL::Test::Cluster->new('standby');
@@ -178,13 +175,15 @@ sub check_slots_conflict_reason
 
 	$res = $node_standby->safe_psql(
 		'postgres', qq(
-			 select invalidation_reason from pg_replication_slots where slot_name = '$active_slot' and conflicting;));
+			 select invalidation_reason from pg_replication_slots where slot_name = '$active_slot' and conflicting;)
+	);
 
 	is($res, "$reason", "$active_slot reason for conflict is $reason");
 
 	$res = $node_standby->safe_psql(
 		'postgres', qq(
-			 select invalidation_reason from pg_replication_slots where slot_name = '$inactive_slot' and conflicting;));
+			 select invalidation_reason from pg_replication_slots where slot_name = '$inactive_slot' and conflicting;)
+	);
 
 	is($res, "$reason", "$inactive_slot reason for conflict is $reason");
 }
@@ -496,7 +495,8 @@ $node_subscriber->stop;
 # Scenario 1: hot_standby_feedback off and vacuum FULL
 #
 # In passing, ensure that replication slot stats are not removed when the
-# active slot is invalidated.
+# active slot is invalidated, and check that an error occurs when
+# attempting to alter the invalid slot.
 ##################################################
 
 # One way to produce recovery conflict is to create/drop a relation and
@@ -526,6 +526,15 @@ check_for_invalidation('vacuum_full_', 1, 'with vacuum FULL on pg_class');
 
 # Verify reason for conflict is 'rows_removed' in pg_replication_slots
 check_slots_conflict_reason('vacuum_full_', 'rows_removed');
+
+# Attempting to alter an invalidated slot should result in an error
+($result, $stdout, $stderr) = $node_standby->psql(
+    'postgres',
+    qq[ALTER_REPLICATION_SLOT vacuum_full_inactiveslot (failover);],
+    replication => 'database');
+ok($stderr =~ /ERROR:  cannot alter invalid replication slot "vacuum_full_inactiveslot"/ &&
+   $stderr =~ /DETAIL:  This replication slot has been invalidated due to "rows_removed"./,
+    "invalidated slot cannot be altered");
 
 # Ensure that replication slot stats are not removed after invalidation.
 is( $node_standby->safe_psql(
@@ -559,7 +568,8 @@ check_slots_conflict_reason('vacuum_full_', 'rows_removed');
 ##################################################
 
 # Get the restart_lsn from an invalidated slot
-my $restart_lsn = $node_standby->safe_psql('postgres',
+my $restart_lsn = $node_standby->safe_psql(
+	'postgres',
 	"SELECT restart_lsn FROM pg_replication_slots
 		WHERE slot_name = 'vacuum_full_activeslot' AND conflicting;"
 );
@@ -791,7 +801,7 @@ $handle =
   make_slot_active($node_standby, 'wal_level_', 0, \$stdout, \$stderr);
 # We are not able to read from the slot as it requires wal_level >= logical on the primary server
 check_pg_recvlogical_stderr($handle,
-	"logical decoding on standby requires wal_level >= logical on the primary"
+	"logical decoding on standby requires \"wal_level\" >= \"logical\" on the primary"
 );
 
 # Restore primary wal_level

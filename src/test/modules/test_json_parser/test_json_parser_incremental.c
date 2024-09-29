@@ -15,6 +15,9 @@
  * If the "-c SIZE" option is provided, that chunk size is used instead
  * of the default of 60.
  *
+ * If the -s flag is given, the program does semantic processing. This should
+ * just mirror back the json, albeit with white space changes.
+ *
  * The argument specifies the file containing the JSON input.
  *
  *-------------------------------------------------------------------------
@@ -28,6 +31,7 @@
 #include <unistd.h>
 
 #include "common/jsonapi.h"
+#include "common/logging.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include "pg_getopt.h"
@@ -56,7 +60,7 @@ static JsonParseErrorType do_array_element_start(void *state, bool isnull);
 static JsonParseErrorType do_array_element_end(void *state, bool isnull);
 static JsonParseErrorType do_scalar(void *state, char *token, JsonTokenType tokentype);
 
-JsonSemAction sem = {
+static JsonSemAction sem = {
 	.object_start = do_object_start,
 	.object_end = do_object_end,
 	.object_field_start = do_object_field_start,
@@ -80,22 +84,21 @@ main(int argc, char **argv)
 	size_t		chunk_size = DEFAULT_CHUNK_SIZE;
 	struct stat statbuf;
 	off_t		bytes_left;
-	JsonSemAction *testsem = &nullSemAction;
+	const JsonSemAction *testsem = &nullSemAction;
 	char	   *testfile;
 	int			c;
 	bool		need_strings = false;
+
+	pg_logging_init(argv[0]);
 
 	while ((c = getopt(argc, argv, "c:s")) != -1)
 	{
 		switch (c)
 		{
 			case 'c':			/* chunksize */
-				sscanf(optarg, "%zu", &chunk_size);
+				chunk_size = strtou64(optarg, NULL, 10);
 				if (chunk_size > BUFSIZE)
-				{
-					fprintf(stderr, "chunk size cannot exceed %d\n", BUFSIZE);
-					exit(1);
-				}
+					pg_fatal("chunk size cannot exceed %d", BUFSIZE);
 				break;
 			case 's':			/* do semantic processing */
 				testsem = &sem;
@@ -121,13 +124,25 @@ main(int argc, char **argv)
 	makeJsonLexContextIncremental(&lex, PG_UTF8, need_strings);
 	initStringInfo(&json);
 
-	json_file = fopen(testfile, "r");
-	fstat(fileno(json_file), &statbuf);
+	if ((json_file = fopen(testfile, PG_BINARY_R)) == NULL)
+		pg_fatal("error opening input: %m");
+
+	if (fstat(fileno(json_file), &statbuf) != 0)
+		pg_fatal("error statting input: %m");
+
 	bytes_left = statbuf.st_size;
 
 	for (;;)
 	{
+		/* We will break when there's nothing left to read */
+
+		if (bytes_left < chunk_size)
+			chunk_size = bytes_left;
+
 		n_read = fread(buff, 1, chunk_size, json_file);
+		if (n_read < chunk_size)
+			pg_fatal("error reading input file: %d", ferror(json_file));
+
 		appendBinaryStringInfo(&json, buff, n_read);
 
 		/*

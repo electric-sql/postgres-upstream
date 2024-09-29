@@ -36,6 +36,7 @@
 #include "access/transam.h"
 #include "access/twophase.h"
 #include "access/xlogutils.h"
+#include "commands/waitlsn.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
@@ -102,6 +103,8 @@ ProcGlobalShmemSize(void)
 	Size		size = 0;
 	Size		TotalProcs =
 		add_size(MaxBackends, add_size(NUM_AUXILIARY_PROCS, max_prepared_xacts));
+	Size		fpLockBitsSize,
+				fpRelIdSize;
 
 	/* ProcGlobal */
 	size = add_size(size, sizeof(PROC_HDR));
@@ -111,6 +114,15 @@ ProcGlobalShmemSize(void)
 	size = add_size(size, mul_size(TotalProcs, sizeof(*ProcGlobal->xids)));
 	size = add_size(size, mul_size(TotalProcs, sizeof(*ProcGlobal->subxidStates)));
 	size = add_size(size, mul_size(TotalProcs, sizeof(*ProcGlobal->statusFlags)));
+
+	/*
+	 * Memory needed for PGPROC fast-path lock arrays. Make sure the sizes are
+	 * nicely aligned in each backend.
+	 */
+	fpLockBitsSize = MAXALIGN(FastPathLockGroupsPerBackend * sizeof(uint64));
+	fpRelIdSize = MAXALIGN(FastPathLockGroupsPerBackend * sizeof(Oid) * FP_LOCK_SLOTS_PER_GROUP);
+
+	size = add_size(size, mul_size(TotalProcs, (fpLockBitsSize + fpRelIdSize)));
 
 	return size;
 }
@@ -162,6 +174,12 @@ InitProcGlobal(void)
 	bool		found;
 	uint32		TotalProcs = MaxBackends + NUM_AUXILIARY_PROCS + max_prepared_xacts;
 
+	/* Used for setup of per-backend fast-path slots. */
+	char	   *fpPtr,
+			   *fpEndPtr PG_USED_FOR_ASSERTS_ONLY;
+	Size		fpLockBitsSize,
+				fpRelIdSize;
+
 	/* Create the ProcGlobal shared structure */
 	ProcGlobal = (PROC_HDR *)
 		ShmemInitStruct("Proc Header", sizeof(PROC_HDR), &found);
@@ -210,11 +228,37 @@ InitProcGlobal(void)
 	ProcGlobal->statusFlags = (uint8 *) ShmemAlloc(TotalProcs * sizeof(*ProcGlobal->statusFlags));
 	MemSet(ProcGlobal->statusFlags, 0, TotalProcs * sizeof(*ProcGlobal->statusFlags));
 
+	/*
+	 * Allocate arrays for fast-path locks. Those are variable-length, so
+	 * can't be included in PGPROC directly. We allocate a separate piece of
+	 * shared memory and then divide that between backends.
+	 */
+	fpLockBitsSize = MAXALIGN(FastPathLockGroupsPerBackend * sizeof(uint64));
+	fpRelIdSize = MAXALIGN(FastPathLockGroupsPerBackend * sizeof(Oid) * FP_LOCK_SLOTS_PER_GROUP);
+
+	fpPtr = ShmemAlloc(TotalProcs * (fpLockBitsSize + fpRelIdSize));
+	MemSet(fpPtr, 0, TotalProcs * (fpLockBitsSize + fpRelIdSize));
+
+	/* For asserts checking we did not overflow. */
+	fpEndPtr = fpPtr + (TotalProcs * (fpLockBitsSize + fpRelIdSize));
+
 	for (i = 0; i < TotalProcs; i++)
 	{
 		PGPROC	   *proc = &procs[i];
 
 		/* Common initialization for all PGPROCs, regardless of type. */
+
+		/*
+		 * Set the fast-path lock arrays, and move the pointer. We interleave
+		 * the two arrays, to (hopefully) get some locality for each backend.
+		 */
+		proc->fpLockBits = (uint64 *) fpPtr;
+		fpPtr += fpLockBitsSize;
+
+		proc->fpRelId = (Oid *) fpPtr;
+		fpPtr += fpRelIdSize;
+
+		Assert(fpPtr <= fpEndPtr);
 
 		/*
 		 * Set up per-PGPROC semaphore, latch, and fpInfoLock.  Prepared xact
@@ -277,6 +321,9 @@ InitProcGlobal(void)
 		pg_atomic_init_u64(&(proc->waitStart), 0);
 	}
 
+	/* Should have consumed exactly the expected amount of fast-path memory. */
+	Assert(fpPtr == fpEndPtr);
+
 	/*
 	 * Save pointers to the blocks of PGPROC structures reserved for auxiliary
 	 * processes and prepared transactions.
@@ -330,7 +377,7 @@ InitProcess(void)
 
 	if (!dlist_is_empty(procgloballist))
 	{
-		MyProc = (PGPROC *) dlist_pop_head_node(procgloballist);
+		MyProc = dlist_container(PGPROC, links, dlist_pop_head_node(procgloballist));
 		SpinLockRelease(ProcStructLock);
 	}
 	else
@@ -345,7 +392,7 @@ InitProcess(void)
 		if (AmWalSenderProcess())
 			ereport(FATAL,
 					(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
-					 errmsg("number of requested standby connections exceeds max_wal_senders (currently %d)",
+					 errmsg("number of requested standby connections exceeds \"max_wal_senders\" (currently %d)",
 							max_wal_senders)));
 		ereport(FATAL,
 				(errcode(ERRCODE_TOO_MANY_CONNECTIONS),
@@ -862,6 +909,11 @@ ProcKill(int code, Datum arg)
 	 */
 	LWLockReleaseAll();
 
+	/*
+	 * Cleanup waiting for LSN if any.
+	 */
+	WaitLSNCleanup();
+
 	/* Cancel any pending condition variable sleep, too */
 	ConditionVariableCancelSleep();
 
@@ -1047,15 +1099,15 @@ AuxiliaryPidGetProc(int pid)
  * called, because it could be that when we try to find a position at which
  * to insert ourself into the wait queue, we discover that we must be inserted
  * ahead of everyone who wants a lock that conflict with ours. In that case,
- * we get the lock immediately. Beause of this, it's sensible for this function
+ * we get the lock immediately. Because of this, it's sensible for this function
  * to have a dontWait argument, despite the name.
  *
  * The lock table's partition lock must be held at entry, and will be held
  * at exit.
  *
  * Result: PROC_WAIT_STATUS_OK if we acquired the lock, PROC_WAIT_STATUS_ERROR
- * if not (if dontWait = true, this is a deadlock; if dontWait = false, we
- * would have had to wait).
+ * if not (if dontWait = true, we would have had to wait; if dontWait = false,
+ * this is a deadlock).
  *
  * ASSUME: that no one will fiddle with the queue until after
  *		we release the partition lock.

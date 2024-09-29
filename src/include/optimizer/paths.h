@@ -72,9 +72,6 @@ extern void create_index_paths(PlannerInfo *root, RelOptInfo *rel);
 extern bool relation_has_unique_index_for(PlannerInfo *root, RelOptInfo *rel,
 										  List *restrictlist,
 										  List *exprlist, List *oprlist);
-extern bool relation_has_unique_index_ext(PlannerInfo *root, RelOptInfo *rel,
-										  List *restrictlist, List *exprlist,
-										  List *oprlist, List **extra_clauses);
 extern bool indexcol_is_bool_constant_for_query(PlannerInfo *root,
 												IndexOptInfo *index,
 												int indexcol);
@@ -86,7 +83,7 @@ extern void check_index_predicates(PlannerInfo *root, RelOptInfo *rel);
  * tidpath.c
  *	  routines to generate tid paths
  */
-extern void create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel);
+extern bool create_tidscan_paths(PlannerInfo *root, RelOptInfo *rel);
 
 /*
  * joinpath.c
@@ -131,6 +128,7 @@ extern bool process_equivalence(PlannerInfo *root,
 extern Expr *canonicalize_ec_expression(Expr *expr,
 										Oid req_type, Oid req_collation);
 extern void reconsider_outer_join_clauses(PlannerInfo *root);
+extern void rebuild_eclass_attr_needed(PlannerInfo *root);
 extern EquivalenceClass *get_eclass_for_sort_expr(PlannerInfo *root,
 												  Expr *expr,
 												  List *opfamilies,
@@ -161,7 +159,8 @@ extern List *generate_join_implied_equalities_for_ecs(PlannerInfo *root,
 													  Relids join_relids,
 													  Relids outer_relids,
 													  RelOptInfo *inner_rel);
-extern bool exprs_known_equal(PlannerInfo *root, Node *item1, Node *item2);
+extern bool exprs_known_equal(PlannerInfo *root, Node *item1, Node *item2,
+							  Oid opfamily);
 extern EquivalenceClass *match_eclasses_to_foreign_key_col(PlannerInfo *root,
 														   ForeignKeyOptInfo *fkinfo,
 														   int colno);
@@ -242,7 +241,9 @@ extern List *make_pathkeys_for_sortclauses_extended(PlannerInfo *root,
 													List **sortclauses,
 													List *tlist,
 													bool remove_redundant,
-													bool *sortable);
+													bool remove_group_rtindex,
+													bool *sortable,
+													bool set_ec_sortref);
 extern void initialize_mergeclause_eclasses(PlannerInfo *root,
 											RestrictInfo *restrictinfo);
 extern void update_mergeclause_eclasses(PlannerInfo *root,

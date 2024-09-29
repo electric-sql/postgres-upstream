@@ -80,7 +80,7 @@ static PGresult *executeQuery(PGconn *conn, const char *query);
 static void executeCommand(PGconn *conn, const char *query);
 static void expand_dbname_patterns(PGconn *conn, SimpleStringList *patterns,
 								   SimpleStringList *names);
-static void read_dumpall_filters(const char *filename, SimpleStringList *patterns);
+static void read_dumpall_filters(const char *filename, SimpleStringList *pattern);
 
 static char pg_dump_bin[MAXPGPATH];
 static const char *progname;
@@ -658,7 +658,7 @@ help(void)
 	printf(_("  --disable-triggers           disable triggers during data-only restore\n"));
 	printf(_("  --exclude-database=PATTERN   exclude databases whose name matches PATTERN\n"));
 	printf(_("  --extra-float-digits=NUM     override default setting for extra_float_digits\n"));
-	printf(_("  --filter=FILENAME            exclude databases specified in FILENAME\n"));
+	printf(_("  --filter=FILENAME            exclude databases based on expressions in FILENAME\n"));
 	printf(_("  --if-exists                  use IF EXISTS when dropping objects\n"));
 	printf(_("  --inserts                    dump data as INSERT commands, rather than COPY\n"));
 	printf(_("  --load-via-partition-root    load partitions via the root table\n"));

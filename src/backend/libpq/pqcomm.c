@@ -76,6 +76,7 @@
 #include "libpq/libpq.h"
 #include "miscadmin.h"
 #include "port/pg_bswap.h"
+#include "postmaster/postmaster.h"
 #include "storage/ipc.h"
 #include "utils/guc_hooks.h"
 #include "utils/memutils.h"
@@ -731,7 +732,7 @@ Setup_AF_UNIX(const char *sock_path)
 	if (Unix_socket_group[0] != '\0')
 	{
 #ifdef WIN32
-		elog(WARNING, "configuration item unix_socket_group is not supported on this platform");
+		elog(WARNING, "configuration item \"unix_socket_group\" is not supported on this platform");
 #else
 		char	   *endptr;
 		unsigned long val;

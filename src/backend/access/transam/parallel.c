@@ -1398,9 +1398,13 @@ ParallelWorkerMain(Datum main_arg)
 
 	/*
 	 * Set the client encoding to the database encoding, since that is what
-	 * the leader will expect.
+	 * the leader will expect.  (We're cheating a bit by not calling
+	 * PrepareClientEncoding first.  It's okay because this call will always
+	 * result in installing a no-op conversion.  No error should be possible,
+	 * but check anyway.)
 	 */
-	SetClientEncoding(GetDatabaseEncoding());
+	if (SetClientEncoding(GetDatabaseEncoding()) < 0)
+		elog(ERROR, "SetClientEncoding(%d) failed", GetDatabaseEncoding());
 
 	/*
 	 * Load libraries that were loaded by original backend.  We want to do
@@ -1410,15 +1414,22 @@ ParallelWorkerMain(Datum main_arg)
 	libraryspace = shm_toc_lookup(toc, PARALLEL_KEY_LIBRARY, false);
 	StartTransactionCommand();
 	RestoreLibraryState(libraryspace);
-
-	/* Restore GUC values from launching backend. */
-	gucspace = shm_toc_lookup(toc, PARALLEL_KEY_GUC, false);
-	RestoreGUCState(gucspace);
 	CommitTransactionCommand();
 
 	/* Crank up a transaction state appropriate to a parallel worker. */
 	tstatespace = shm_toc_lookup(toc, PARALLEL_KEY_TRANSACTION_STATE, false);
 	StartParallelWorkerTransaction(tstatespace);
+
+	/*
+	 * Restore relmapper and reindex state early, since these affect catalog
+	 * access.  Ideally we'd do this even before calling InitPostgres, but
+	 * that has order-of-initialization problems, and also the relmapper would
+	 * get confused during the CommitTransactionCommand call above.
+	 */
+	relmapperspace = shm_toc_lookup(toc, PARALLEL_KEY_RELMAPPER_STATE, false);
+	RestoreRelationMap(relmapperspace);
+	reindexspace = shm_toc_lookup(toc, PARALLEL_KEY_REINDEX_STATE, false);
+	RestoreReindexState(reindexspace);
 
 	/* Restore combo CID state. */
 	combocidspace = shm_toc_lookup(toc, PARALLEL_KEY_COMBO_CID, false);
@@ -1456,6 +1467,14 @@ ParallelWorkerMain(Datum main_arg)
 	InvalidateSystemCaches();
 
 	/*
+	 * Restore GUC values from launching backend.  We can't do this earlier,
+	 * because GUC check hooks that do catalog lookups need to see the same
+	 * database state as the leader.
+	 */
+	gucspace = shm_toc_lookup(toc, PARALLEL_KEY_GUC, false);
+	RestoreGUCState(gucspace);
+
+	/*
 	 * Restore current role id.  Skip verifying whether session user is
 	 * allowed to become this role and blindly restore the leader's state for
 	 * current role.
@@ -1473,14 +1492,6 @@ ParallelWorkerMain(Datum main_arg)
 	pendingsyncsspace = shm_toc_lookup(toc, PARALLEL_KEY_PENDING_SYNCS,
 									   false);
 	RestorePendingSyncs(pendingsyncsspace);
-
-	/* Restore reindex state. */
-	reindexspace = shm_toc_lookup(toc, PARALLEL_KEY_REINDEX_STATE, false);
-	RestoreReindexState(reindexspace);
-
-	/* Restore relmapper state. */
-	relmapperspace = shm_toc_lookup(toc, PARALLEL_KEY_RELMAPPER_STATE, false);
-	RestoreRelationMap(relmapperspace);
 
 	/* Restore uncommitted enums. */
 	uncommittedenumsspace = shm_toc_lookup(toc, PARALLEL_KEY_UNCOMMITTEDENUMS,

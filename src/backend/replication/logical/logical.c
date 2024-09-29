@@ -118,7 +118,7 @@ CheckLogicalDecodingRequirements(void)
 	if (wal_level < WAL_LEVEL_LOGICAL)
 		ereport(ERROR,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("logical decoding requires wal_level >= logical")));
+				 errmsg("logical decoding requires \"wal_level\" >= \"logical\"")));
 
 	if (MyDatabaseId == InvalidOid)
 		ereport(ERROR,
@@ -138,7 +138,7 @@ CheckLogicalDecodingRequirements(void)
 		if (GetActiveWalLevelOnStandby() < WAL_LEVEL_LOGICAL)
 			ereport(ERROR,
 					(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-					 errmsg("logical decoding on standby requires wal_level >= logical on the primary")));
+					 errmsg("logical decoding on standby requires \"wal_level\" >= \"logical\" on the primary")));
 	}
 }
 
@@ -152,6 +152,7 @@ StartupDecodingContext(List *output_plugin_options,
 					   TransactionId xmin_horizon,
 					   bool need_full_snapshot,
 					   bool fast_forward,
+					   bool in_create,
 					   XLogReaderRoutine *xl_routine,
 					   LogicalOutputPluginWriterPrepareWrite prepare_write,
 					   LogicalOutputPluginWriterWrite do_write,
@@ -212,7 +213,7 @@ StartupDecodingContext(List *output_plugin_options,
 	ctx->reorder = ReorderBufferAllocate();
 	ctx->snapshot_builder =
 		AllocateSnapshotBuilder(ctx->reorder, xmin_horizon, start_lsn,
-								need_full_snapshot, slot->data.two_phase_at);
+								need_full_snapshot, in_create, slot->data.two_phase_at);
 
 	ctx->reorder->private_data = ctx;
 
@@ -438,7 +439,7 @@ CreateInitDecodingContext(const char *plugin,
 	ReplicationSlotSave();
 
 	ctx = StartupDecodingContext(NIL, restart_lsn, xmin_horizon,
-								 need_full_snapshot, false,
+								 need_full_snapshot, false, true,
 								 xl_routine, prepare_write, do_write,
 								 update_progress);
 
@@ -538,7 +539,7 @@ CreateDecodingContext(XLogRecPtr start_lsn,
 				errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
 				errmsg("cannot use replication slot \"%s\" for logical decoding",
 					   NameStr(slot->data.name)),
-				errdetail("This slot is being synchronized from the primary server."),
+				errdetail("This replication slot is being synchronized from the primary server."),
 				errhint("Specify another replication slot."));
 
 	/*
@@ -592,7 +593,7 @@ CreateDecodingContext(XLogRecPtr start_lsn,
 
 	ctx = StartupDecodingContext(output_plugin_options,
 								 start_lsn, InvalidTransactionId, false,
-								 fast_forward, xl_routine, prepare_write,
+								 fast_forward, false, xl_routine, prepare_write,
 								 do_write, update_progress);
 
 	/* call output plugin initialization callback */

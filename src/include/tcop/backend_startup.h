@@ -4,7 +4,7 @@
  *	  prototypes for backend_startup.c.
  *
  *
- * Portions Copyright (c) 1996-2023, PostgreSQL Global Development Group
+ * Portions Copyright (c) 1996-2024, PostgreSQL Global Development Group
  * Portions Copyright (c) 1994, Regents of the University of California
  *
  * src/include/tcop/backend_startup.h
@@ -13,6 +13,9 @@
  */
 #ifndef BACKEND_STARTUP_H
 #define BACKEND_STARTUP_H
+
+/* GUCs */
+extern PGDLLIMPORT bool Trace_connection_negotiation;
 
 /*
  * CAC_state is passed from postmaster to the backend process, to indicate

@@ -1325,6 +1325,7 @@ SELCT 1/0;<!-- this typo is intentional -->
      <member><varname>IntervalStyle</varname></member>
      <member><varname>is_superuser</varname></member>
      <member><varname>scram_iterations</varname></member>
+     <member><varname>search_path</varname></member>
      <member><varname>server_encoding</varname></member>
      <member><varname>server_version</varname></member>
      <member><varname>session_authorization</varname></member>
@@ -1334,7 +1335,8 @@ SELCT 1/0;<!-- this typo is intentional -->
     (<varname>default_transaction_read_only</varname> and
     <varname>in_hot_standby</varname> were not reported by releases before
     14; <varname>scram_iterations</varname> was not reported by releases
-    before 16.)
+    before 16; <varname>search_path</varname> was not reported by releases
+    before 18.)
     Note that
     <varname>server_version</varname>,
     <varname>server_encoding</varname> and
@@ -1564,7 +1566,7 @@ SELCT 1/0;<!-- this typo is intentional -->
      required to use the ALPN extension defined
      by <ulink url="https://tools.ietf.org/html/rfc7301">RFC 7301</ulink> to
      protect against protocol confusion attacks.
-     The <productname>PostgreSQL</productname> protocol is "TBD-pgsql" as
+     The <productname>PostgreSQL</productname> protocol is "postgresql" as
      registered
      at <ulink url="https://www.iana.org/assignments/tls-extensiontype-values/tls-extensiontype-values.xhtml#alpn-protocol-ids">IANA
      TLS ALPN Protocol IDs</ulink> registry.
@@ -2192,7 +2194,23 @@ psql "dbname=postgres replication=database" -c "IDENTIFY_SYSTEM;"
        </varlistentry>
       </variablelist>
 
-      <para>The following option is supported:</para>
+      <para>The following options are supported:</para>
+
+      <variablelist>
+       <varlistentry>
+        <term><literal>TWO_PHASE [ <replaceable class="parameter">boolean</replaceable> ]</literal></term>
+        <listitem>
+         <para>
+          If true, this logical replication slot supports decoding of two-phase
+          commit. With this option, commands related to two-phase commit such as
+          <literal>PREPARE TRANSACTION</literal>, <literal>COMMIT PREPARED</literal>
+          and <literal>ROLLBACK PREPARED</literal> are decoded and transmitted.
+          The transaction will be decoded and transmitted at
+          <literal>PREPARE TRANSACTION</literal> time.
+         </para>
+        </listitem>
+       </varlistentry>
+      </variablelist>
 
       <variablelist>
        <varlistentry>

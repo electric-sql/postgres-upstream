@@ -174,7 +174,7 @@ xlog_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 					Assert(RecoveryInProgress());
 					ereport(ERROR,
 							(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-							 errmsg("logical decoding on standby requires wal_level >= logical on the primary")));
+							 errmsg("logical decoding on standby requires \"wal_level\" >= \"logical\" on the primary")));
 				}
 				break;
 			}
@@ -301,12 +301,13 @@ xact_decode(LogicalDecodingContext *ctx, XLogRecordBuffer *buf)
 					ReorderBufferXidSetCatalogChanges(ctx->reorder, xid,
 													  buf->origptr);
 				}
-				else if ((!ctx->fast_forward))
+				else if (!ctx->fast_forward)
 					ReorderBufferImmediateInvalidation(ctx->reorder,
 													   invals->nmsgs,
 													   invals->msgs);
+
+				break;
 			}
-			break;
 		case XLOG_XACT_PREPARE:
 			{
 				xl_xact_parsed_prepare parsed;

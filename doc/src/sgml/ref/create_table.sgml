@@ -77,7 +77,6 @@ CREATE [ [ GLOBAL | LOCAL ] { TEMPORARY | TEMP } | UNLOGGED ] TABLE [ IF NOT EXI
 
 [ CONSTRAINT <replaceable class="parameter">constraint_name</replaceable> ]
 { CHECK ( <replaceable class="parameter">expression</replaceable> ) [ NO INHERIT ] |
-  NOT NULL <replaceable class="parameter">column_name</replaceable> [ NO INHERIT ] |
   UNIQUE [ NULLS [ NOT ] DISTINCT ] ( <replaceable class="parameter">column_name</replaceable> [, ... ] [, <replaceable class="parameter">column_name</replaceable> WITHOUT OVERLAPS ] ) <replaceable class="parameter">index_parameters</replaceable> |
   PRIMARY KEY ( <replaceable class="parameter">column_name</replaceable> [, ... ] [, <replaceable class="parameter">column_name</replaceable> WITHOUT OVERLAPS ] ) <replaceable class="parameter">index_parameters</replaceable> |
   EXCLUDE [ USING <replaceable class="parameter">index_method</replaceable> ] ( <replaceable class="parameter">exclude_element</replaceable> WITH <replaceable class="parameter">operator</replaceable> [, ... ] ) <replaceable class="parameter">index_parameters</replaceable> [ WHERE ( <replaceable class="parameter">predicate</replaceable> ) ] |
@@ -250,18 +249,18 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
     <listitem>
      <para>
       Creates a <firstterm>typed table</firstterm>, which takes its
-      structure from the specified composite type (name optionally
-      schema-qualified).  A typed table is tied to its type; for
-      example the table will be dropped if the type is dropped
-      (with <literal>DROP TYPE ... CASCADE</literal>).
+      structure from the specified stand-alone composite type (that is,
+      one created using <xref linkend="sql-createtype"/>) though it still
+      produces a new composite type as well.  The table will have a
+      dependency on the referenced type, meaning that cascaded alter and
+      drop actions on that type will propagate to the table.
      </para>
 
      <para>
-      When a typed table is created, then the data types of the
-      columns are determined by the underlying composite type and are
-      not specified by the <literal>CREATE TABLE</literal> command.
+      A typed table always has the same column names and data types as the
+      type it is derived from, so you cannot specify additional columns.
       But the <literal>CREATE TABLE</literal> command can add defaults
-      and constraints to the table and can specify storage parameters.
+      and constraints to the table, as well as specify storage parameters.
      </para>
     </listitem>
    </varlistentry>
@@ -925,8 +924,8 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
      <para>
       This clause creates the column as an <firstterm>identity
       column</firstterm>.  It will have an implicit sequence attached to it
-      and the column in new rows will automatically have values from the
-      sequence assigned to it.
+      and in newly-inserted rows the column will automatically have values
+      from the sequence assigned to it.
       Such a column is implicitly <literal>NOT NULL</literal>.
      </para>
 
@@ -956,9 +955,16 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
      </para>
 
      <para>
-      The optional <replaceable>sequence_options</replaceable> clause can be
-      used to override the options of the sequence.
-      See <xref linkend="sql-createsequence"/> for details.
+      The optional <replaceable>sequence_options</replaceable> clause can
+      be used to override the parameters of the sequence.  The available
+      options include those shown for <xref linkend="sql-createsequence"/>,
+      plus <literal>SEQUENCE NAME <replaceable>name</replaceable></literal>,
+      <literal>LOGGED</literal>, and <literal>UNLOGGED</literal>, which
+      allow selection of the name and persistence level of the
+      sequence.  Without <literal>SEQUENCE NAME</literal>, the system
+      chooses an unused name for the sequence.
+      Without <literal>LOGGED</literal> or <literal>UNLOGGED</literal>,
+      the sequence will have the same persistence level as the table.
      </para>
     </listitem>
    </varlistentry>
@@ -986,21 +992,18 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       duplicates so long as the duplicates don't overlap in the
       <literal>WITHOUT OVERLAPS</literal> column.  (This is sometimes called a
       temporal key, if the column is a range of dates or timestamps, but
-      PostgreSQL allows ranges over any base type.)  In effect, such a
-      constraint is enforced with an <literal>EXCLUDE</literal> constraint
-      rather than a <literal>UNIQUE</literal> constraint.  So for example
-      <literal>UNIQUE (id, valid_at WITHOUT OVERLAPS)</literal> behaves like
-      <literal>EXCLUDE USING GIST (id WITH =, valid_at WITH
+      <productname>PostgreSQL</productname> allows ranges over any base type.)
+      In effect, such a constraint is enforced with an <literal>EXCLUDE</literal>
+      constraint rather than a <literal>UNIQUE</literal> constraint.  So for
+      example <literal>UNIQUE (id, valid_at WITHOUT OVERLAPS)</literal> behaves
+      like <literal>EXCLUDE USING GIST (id WITH =, valid_at WITH
       &amp;&amp;)</literal>.  The <literal>WITHOUT OVERLAPS</literal> column
-      must have a range or multirange type.  (Technically, any type is allowed
-      whose default GiST opclass includes an overlaps operator.  See the
-      <literal>stratnum</literal> support function under <xref
-      linkend="gist-extensibility"/> for details.)  The non-<literal>WITHOUT
-      OVERLAPS</literal> columns of the constraint can be any type that can be
-      compared for equality in a GiST index.  By default, only range types are
-      supported, but you can use other types by adding the <xref
-      linkend="btree-gist"/> extension (which is the expected way to use this
-      feature).
+      must have a range or multirange type.  Empty ranges/multiranges are
+      not permitted.  The non-<literal>WITHOUT OVERLAPS</literal> columns of
+      the constraint can be any type that can be compared for equality in a
+      GiST index.  By default, only range types are supported, but you can use
+      other types by adding the <xref linkend="btree-gist"/> extension (which
+      is the expected way to use this feature).
      </para>
 
      <para>
@@ -1024,11 +1027,11 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
      </para>
 
      <para>
-      Adding a unique constraint will automatically create a unique B-tree
+      Adding a unique constraint will automatically create a unique btree
       index on the column or group of columns used in the constraint.  But if
       the constraint includes a <literal>WITHOUT OVERLAPS</literal> clause, it
-      will use a GiST index.  The created index has the same name as the unique
-      constraint.
+      will use a GiST index.  The created index has the same name as the
+      unique constraint.
      </para>
 
      <para>
@@ -1079,11 +1082,10 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
      </para>
 
      <para>
-      As with a <literal>UNIQUE</literal> constraint, adding a
-      <literal>PRIMARY KEY</literal> constraint will automatically create a
-      unique B-tree index, or GiST if <literal>WITHOUT OVERLAPS</literal> was
-      specified, on the column or group of columns used in the constraint.
-      That index has the same name as the primary key constraint.
+      Adding a <literal>PRIMARY KEY</literal> constraint will automatically
+      create a unique btree index on the column or group of columns used in
+      the constraint, or GiST if <literal>WITHOUT OVERLAPS</literal> was
+      specified.
      </para>
 
      <para>
@@ -1184,11 +1186,13 @@ WITH ( MODULUS <replaceable class="parameter">numeric_literal</replaceable>, REM
       referent for its entire duration.  This column must be a range or
       multirange type.  In addition, the referenced table must have a primary
       key or unique constraint declared with <literal>WITHOUT
-      OVERLAPS</literal>.  Finally, if one side of the foreign key uses
-      <literal>PERIOD</literal>, the other side must too.  If the <replaceable
-      class="parameter">refcolumn</replaceable> list is omitted, the
-      <literal>WITHOUT OVERLAPS</literal> part of the primary key is treated
-      as if marked with <literal>PERIOD</literal>.
+      OVERLAPS</literal>. Finally, if the foreign key has a PERIOD
+      <replaceable class="parameter">column_name</replaceable> specification
+      the corresponding <replaceable class="parameter">refcolumn</replaceable>,
+      if present, must also be marked <literal>PERIOD</literal>.  If the
+      <replaceable class="parameter">refcolumn</replaceable> clause is omitted,
+      and thus the reftable's primary key constraint chosen, the primary key
+      must have its final column marked <literal>WITHOUT OVERLAPS</literal>.
      </para>
 
      <para>
@@ -2389,6 +2393,13 @@ CREATE TABLE cities_partdef
     constraints), because the associated index is named the same as the
     constraint, and index names must be unique across all relations within
     the same schema.
+   </para>
+
+   <para>
+    Currently, <productname>PostgreSQL</productname> does not record names
+    for not-null constraints at all, so they are not
+    subject to the uniqueness restriction.  This might change in a future
+    release.
    </para>
   </refsect2>
 

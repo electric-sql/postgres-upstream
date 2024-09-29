@@ -50,6 +50,8 @@ tests += {
       'user_activity',
       'wal',
       'entry_timestamp',
+      'privileges',
+      'extended',
       'cleanup',
       'oldextversions',
     ],

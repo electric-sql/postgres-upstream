@@ -114,7 +114,7 @@ NOTICE:  notice triggered for injection point TestInjectionLog2
 (1 row)
 
 SELECT injection_points_detach('TestInjectionLog'); -- fails
-ERROR:  injection point "TestInjectionLog" not found
+ERROR:  could not detach injection point "TestInjectionLog"
 SELECT injection_points_run('TestInjectionLog2'); -- notice
 NOTICE:  notice triggered for injection point TestInjectionLog2
  injection_points_run 
@@ -123,6 +123,51 @@ NOTICE:  notice triggered for injection point TestInjectionLog2
 (1 row)
 
 SELECT injection_points_detach('TestInjectionLog2');
+ injection_points_detach 
+-------------------------
+ 
+(1 row)
+
+-- Loading
+SELECT injection_points_cached('TestInjectionLogLoad'); -- nothing in cache
+ injection_points_cached 
+-------------------------
+ 
+(1 row)
+
+SELECT injection_points_load('TestInjectionLogLoad'); -- nothing
+ injection_points_load 
+-----------------------
+ 
+(1 row)
+
+SELECT injection_points_attach('TestInjectionLogLoad', 'notice');
+ injection_points_attach 
+-------------------------
+ 
+(1 row)
+
+SELECT injection_points_load('TestInjectionLogLoad'); -- nothing happens
+ injection_points_load 
+-----------------------
+ 
+(1 row)
+
+SELECT injection_points_cached('TestInjectionLogLoad'); -- runs from cache
+NOTICE:  notice triggered for injection point TestInjectionLogLoad
+ injection_points_cached 
+-------------------------
+ 
+(1 row)
+
+SELECT injection_points_run('TestInjectionLogLoad'); -- runs from cache
+NOTICE:  notice triggered for injection point TestInjectionLogLoad
+ injection_points_run 
+----------------------
+ 
+(1 row)
+
+SELECT injection_points_detach('TestInjectionLogLoad');
  injection_points_detach 
 -------------------------
  

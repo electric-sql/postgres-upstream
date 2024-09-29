@@ -15,7 +15,6 @@ unless (($ENV{with_ssl} || "") eq 'openssl')
 	plan skip_all => 'OpenSSL not supported by this build';
 }
 
-my $clearpass = "FooBaR1";
 my $rot13pass = "SbbOnE1";
 
 # see the Makefile for how the certificate and key have been generated
@@ -56,7 +55,7 @@ my $log_contents = slurp_file($log);
 
 like(
 	$log_contents,
-	qr/WARNING.*ssl_passphrase_command setting ignored by ssl_passphrase_func module/,
+	qr/WARNING.*"ssl_passphrase_command" setting ignored by ssl_passphrase_func module/,
 	"ssl_passphrase_command set warning");
 
 # set the wrong passphrase

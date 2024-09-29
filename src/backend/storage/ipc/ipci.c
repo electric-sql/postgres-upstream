@@ -25,6 +25,7 @@
 #include "access/xlogprefetcher.h"
 #include "access/xlogrecovery.h"
 #include "commands/async.h"
+#include "commands/waitlsn.h"
 #include "miscadmin.h"
 #include "pgstat.h"
 #include "postmaster/autovacuum.h"
@@ -94,7 +95,6 @@ CalculateShmemSize(int *num_semaphores)
 
 	/* Compute number of semaphores we'll need */
 	numSemas = ProcGlobalSemas();
-	numSemas += SpinlockSemas();
 
 	/* Return the number of semaphores if requested by the caller */
 	if (num_semaphores)
@@ -111,13 +111,12 @@ CalculateShmemSize(int *num_semaphores)
 	 */
 	size = 100000;
 	size = add_size(size, PGSemaphoreShmemSize(numSemas));
-	size = add_size(size, SpinlockSemaSize());
 	size = add_size(size, hash_estimate_size(SHMEM_INDEX_SIZE,
 											 sizeof(ShmemIndexEnt)));
 	size = add_size(size, dsm_estimate_size());
 	size = add_size(size, DSMRegistryShmemSize());
-	size = add_size(size, BufferShmemSize());
-	size = add_size(size, LockShmemSize());
+	size = add_size(size, BufferManagerShmemSize());
+	size = add_size(size, LockManagerShmemSize());
 	size = add_size(size, PredicateLockShmemSize());
 	size = add_size(size, ProcGlobalShmemSize());
 	size = add_size(size, XLogPrefetchShmemSize());
@@ -133,7 +132,7 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, LWLockShmemSize());
 	size = add_size(size, ProcArrayShmemSize());
 	size = add_size(size, BackendStatusShmemSize());
-	size = add_size(size, SInvalShmemSize());
+	size = add_size(size, SharedInvalShmemSize());
 	size = add_size(size, PMSignalShmemSize());
 	size = add_size(size, ProcSignalShmemSize());
 	size = add_size(size, CheckpointerShmemSize());
@@ -149,12 +148,10 @@ CalculateShmemSize(int *num_semaphores)
 	size = add_size(size, SyncScanShmemSize());
 	size = add_size(size, AsyncShmemSize());
 	size = add_size(size, StatsShmemSize());
-	size = add_size(size, WaitEventExtensionShmemSize());
+	size = add_size(size, WaitEventCustomShmemSize());
 	size = add_size(size, InjectionPointShmemSize());
 	size = add_size(size, SlotSyncShmemSize());
-#ifdef EXEC_BACKEND
-	size = add_size(size, ShmemBackendArraySize());
-#endif
+	size = add_size(size, WaitLSNShmemSize());
 
 	/* include additional requested shmem from preload libraries */
 	size = add_size(size, total_addin_request);
@@ -180,6 +177,12 @@ AttachSharedMemoryStructs(void)
 	/* InitProcess must've been called already */
 	Assert(MyProc != NULL);
 	Assert(IsUnderPostmaster);
+
+	/*
+	 * In EXEC_BACKEND mode, backends don't inherit the number of fast-path
+	 * groups we calculated before setting the shmem up, so recalculate it.
+	 */
+	InitializeFastPathLocks();
 
 	CreateOrAttachShmemStructs();
 
@@ -229,28 +232,12 @@ CreateSharedMemoryAndSemaphores(void)
 	PGReserveSemaphores(numSemas);
 
 	/*
-	 * If spinlocks are disabled, initialize emulation layer (which depends on
-	 * semaphores, so the order is important here).
-	 */
-#ifndef HAVE_SPINLOCKS
-	SpinlockSemaInit();
-#endif
-
-	/*
 	 * Set up shared memory allocation mechanism
 	 */
 	InitShmemAllocation();
 
 	/* Initialize subsystems */
 	CreateOrAttachShmemStructs();
-
-#ifdef EXEC_BACKEND
-
-	/*
-	 * Alloc the win32 shared backend array
-	 */
-	ShmemBackendArrayAllocation();
-#endif
 
 	/* Initialize dynamic shared memory facilities. */
 	dsm_postmaster_startup(shim);
@@ -305,32 +292,32 @@ CreateOrAttachShmemStructs(void)
 	CommitTsShmemInit();
 	SUBTRANSShmemInit();
 	MultiXactShmemInit();
-	InitBufferPool();
+	BufferManagerShmemInit();
 
 	/*
 	 * Set up lock manager
 	 */
-	InitLocks();
+	LockManagerShmemInit();
 
 	/*
 	 * Set up predicate lock manager
 	 */
-	InitPredicateLocks();
+	PredicateLockShmemInit();
 
 	/*
 	 * Set up process table
 	 */
 	if (!IsUnderPostmaster)
 		InitProcGlobal();
-	CreateSharedProcArray();
-	CreateSharedBackendStatus();
+	ProcArrayShmemInit();
+	BackendStatusShmemInit();
 	TwoPhaseShmemInit();
 	BackgroundWorkerShmemInit();
 
 	/*
 	 * Set up shared-inval messaging
 	 */
-	CreateSharedInvalidationState();
+	SharedInvalShmemInit();
 
 	/*
 	 * Set up interprocess signaling mechanisms
@@ -355,8 +342,9 @@ CreateOrAttachShmemStructs(void)
 	SyncScanShmemInit();
 	AsyncShmemInit();
 	StatsShmemInit();
-	WaitEventExtensionShmemInit();
+	WaitEventCustomShmemInit();
 	InjectionPointShmemInit();
+	WaitLSNShmemInit();
 }
 
 /*
@@ -372,11 +360,12 @@ InitializeShmemGUCs(void)
 	Size		size_b;
 	Size		size_mb;
 	Size		hp_size;
+	int			num_semas;
 
 	/*
 	 * Calculate the shared memory size and round up to the nearest megabyte.
 	 */
-	size_b = CalculateShmemSize(NULL);
+	size_b = CalculateShmemSize(&num_semas);
 	size_mb = add_size(size_b, (1024 * 1024) - 1) / (1024 * 1024);
 	sprintf(buf, "%zu", size_mb);
 	SetConfigOption("shared_memory_size", buf,
@@ -395,4 +384,7 @@ InitializeShmemGUCs(void)
 		SetConfigOption("shared_memory_size_in_huge_pages", buf,
 						PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 	}
+
+	sprintf(buf, "%d", num_semas);
+	SetConfigOption("num_os_semaphores", buf, PGC_INTERNAL, PGC_S_DYNAMIC_DEFAULT);
 }

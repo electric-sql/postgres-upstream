@@ -16,6 +16,14 @@
 #include <fcntl.h>
 #include <limits.h>
 
+#ifdef HAVE_COPYFILE_H
+#include <copyfile.h>
+#endif
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#endif
+
 #include "backup_label.h"
 #include "common/blkreftable.h"
 #include "common/checksum_helper.h"
@@ -89,7 +97,7 @@ typedef struct cb_tablespace
 } cb_tablespace;
 
 /* Directories to be removed if we exit uncleanly. */
-cb_cleanup_dir *cleanup_dir_list = NULL;
+static cb_cleanup_dir *cleanup_dir_list = NULL;
 
 static void add_tablespace_mapping(cb_options *opt, char *arg);
 static StringInfo check_backup_label_files(int n_backups, char **backup_dirs);
@@ -126,12 +134,13 @@ main(int argc, char *argv[])
 		{"dry-run", no_argument, NULL, 'n'},
 		{"no-sync", no_argument, NULL, 'N'},
 		{"output", required_argument, NULL, 'o'},
-		{"tablespace-mapping", no_argument, NULL, 'T'},
+		{"tablespace-mapping", required_argument, NULL, 'T'},
 		{"manifest-checksums", required_argument, NULL, 1},
 		{"no-manifest", no_argument, NULL, 2},
 		{"sync-method", required_argument, NULL, 3},
 		{"clone", no_argument, NULL, 4},
-		{"copy-file-range", no_argument, NULL, 5},
+		{"copy", no_argument, NULL, 5},
+		{"copy-file-range", no_argument, NULL, 6},
 		{NULL, 0, NULL, 0}
 	};
 
@@ -163,7 +172,7 @@ main(int argc, char *argv[])
 	opt.copy_method = COPY_METHOD_COPY;
 
 	/* process command-line options */
-	while ((c = getopt_long(argc, argv, "dnNPo:T:",
+	while ((c = getopt_long(argc, argv, "dnNo:T:",
 							long_options, &optindex)) != -1)
 	{
 		switch (c)
@@ -201,6 +210,9 @@ main(int argc, char *argv[])
 				opt.copy_method = COPY_METHOD_CLONE;
 				break;
 			case 5:
+				opt.copy_method = COPY_METHOD_COPY;
+				break;
+			case 6:
 				opt.copy_method = COPY_METHOD_COPY_FILE_RANGE;
 				break;
 			default:
@@ -212,7 +224,7 @@ main(int argc, char *argv[])
 
 	if (optind >= argc)
 	{
-		pg_log_error("%s: no input directories specified", progname);
+		pg_log_error("no input directories specified");
 		pg_log_error_hint("Try \"%s --help\" for more information.", progname);
 		exit(1);
 	}
@@ -325,7 +337,7 @@ main(int argc, char *argv[])
 		 * won't have the WAL ranges for the resulting manifest.
 		 */
 		if (manifests[n_prior_backups] == NULL)
-			pg_fatal("can't generate a manifest because no manifest is available for the final input backup");
+			pg_fatal("cannot generate a manifest because no manifest is available for the final input backup");
 	}
 	else
 		mwriter = NULL;
@@ -361,7 +373,7 @@ main(int argc, char *argv[])
 		{
 			char		linkpath[MAXPGPATH];
 
-			snprintf(linkpath, MAXPGPATH, "%s/pg_tblspc/%u", opt.output,
+			snprintf(linkpath, MAXPGPATH, "%s/%s/%u", opt.output, PG_TBLSPC_DIR,
 					 ts->oid);
 
 			if (opt.dry_run)
@@ -523,7 +535,7 @@ check_backup_label_files(int n_backups, char **backup_dirs)
 
 		/* Close the file. */
 		if (close(fd) != 0)
-			pg_fatal("could not close \"%s\": %m", pathbuf);
+			pg_fatal("could not close file \"%s\": %m", pathbuf);
 
 		/* Parse the file contents. */
 		parse_backup_label(pathbuf, buf, &start_tli, &start_lsn,
@@ -583,6 +595,8 @@ check_control_files(int n_backups, char **backup_dirs)
 {
 	int			i;
 	uint64		system_identifier = 0;	/* placate compiler */
+	uint32		data_checksum_version = 0;	/* placate compiler */
+	bool		data_checksum_mismatch = false;
 
 	/* Try to read each control file in turn, last to first. */
 	for (i = n_backups - 1; i >= 0; --i)
@@ -612,6 +626,16 @@ check_control_files(int n_backups, char **backup_dirs)
 					 controlpath, (unsigned long long) system_identifier,
 					 (unsigned long long) control_file->system_identifier);
 
+		/*
+		 * Detect checksum mismatches, but only if the last backup in the
+		 * chain has checksums enabled.
+		 */
+		if (i == n_backups - 1)
+			data_checksum_version = control_file->data_checksum_version;
+		else if (data_checksum_version != 0 &&
+				 data_checksum_version != control_file->data_checksum_version)
+			data_checksum_mismatch = true;
+
 		/* Release memory. */
 		pfree(control_file);
 		pfree(controlpath);
@@ -623,6 +647,16 @@ check_control_files(int n_backups, char **backup_dirs)
 	 */
 	pg_log_debug("system identifier is %llu",
 				 (unsigned long long) system_identifier);
+
+	/*
+	 * Warn the user if not all backups are in the same state with regards to
+	 * checksums.
+	 */
+	if (data_checksum_mismatch)
+	{
+		pg_log_warning("only some backups have checksums enabled");
+		pg_log_warning_hint("Disable, and optionally reenable, checksums on the output directory to avoid failures.");
+	}
 
 	return system_identifier;
 }
@@ -639,7 +673,7 @@ check_input_dir_permissions(char *dir)
 	struct stat st;
 
 	if (stat(dir, &st) != 0)
-		pg_fatal("could not stat \"%s\": %m", dir);
+		pg_fatal("could not stat file \"%s\": %m", dir);
 
 	SetDataDirectoryCreatePerm(st.st_mode);
 }
@@ -727,17 +761,19 @@ help(const char *progname)
 	printf(_("  %s [OPTION]... DIRECTORY...\n"), progname);
 	printf(_("\nOptions:\n"));
 	printf(_("  -d, --debug               generate lots of debugging output\n"));
-	printf(_("  -n, --dry-run             don't actually do anything\n"));
+	printf(_("  -n, --dry-run             do not actually do anything\n"));
 	printf(_("  -N, --no-sync             do not wait for changes to be written safely to disk\n"));
-	printf(_("  -o, --output              output directory\n"));
+	printf(_("  -o, --output=DIRECTORY    output directory\n"));
 	printf(_("  -T, --tablespace-mapping=OLDDIR=NEWDIR\n"
 			 "                            relocate tablespace in OLDDIR to NEWDIR\n"));
+	printf(_("      --clone               clone (reflink) files instead of copying\n"));
+	printf(_("      --copy                copy files (default)\n"));
+	printf(_("      --copy-file-range     copy using copy_file_range() system call\n"));
 	printf(_("      --manifest-checksums=SHA{224,256,384,512}|CRC32C|NONE\n"
 			 "                            use algorithm for manifest checksums\n"));
 	printf(_("      --no-manifest         suppress generation of backup manifest\n"));
 	printf(_("      --sync-method=METHOD  set method for syncing files to disk\n"));
-	printf(_("      --clone               clone (reflink) instead of copying files\n"));
-	printf(_("      --copy-file-range     copy using copy_file_range() syscall\n"));
+	printf(_("  -V, --version             output version information, then exit\n"));
 	printf(_("  -?, --help                show this help, then exit\n"));
 
 	printf(_("\nReport bugs to <%s>.\n"), PACKAGE_BUGREPORT);
@@ -799,25 +835,45 @@ process_directory_recursively(Oid tsoid,
 	char		manifest_prefix[MAXPGPATH];
 	DIR		   *dir;
 	struct dirent *de;
-	bool		is_pg_tblspc;
-	bool		is_pg_wal;
+	bool		is_pg_tblspc = false;
+	bool		is_pg_wal = false;
+	bool		is_incremental_dir = false;
 	manifest_data *latest_manifest = manifests[n_prior_backups];
 	pg_checksum_type checksum_type;
 
 	/*
-	 * pg_tblspc and pg_wal are special cases, so detect those here.
+	 * Classify this directory.
 	 *
-	 * pg_tblspc is only special at the top level, but subdirectories of
-	 * pg_wal are just as special as the top level directory.
+	 * We set is_pg_tblspc only for the toplevel pg_tblspc directory, because
+	 * the symlinks in that specific directory require special handling.
 	 *
-	 * Since incremental backup does not exist in pre-v10 versions, we don't
-	 * have to worry about the old pg_xlog naming.
+	 * We set is_pg_wal for the toplevel WAL directory and all of its
+	 * subdirectories, because those files are not included in the backup
+	 * manifest and hence need special treatment. (Since incremental backup
+	 * does not exist in pre-v10 versions, we don't have to worry about the
+	 * old pg_xlog naming.)
+	 *
+	 * We set is_incremental_dir for directories that can contain incremental
+	 * files requiring reconstruction. If such files occur outside these
+	 * directories, we want to just copy them straight to the output
+	 * directory. This is to protect against a user creating a file with a
+	 * strange name like INCREMENTAL.config and then complaining that
+	 * incremental backups don't work properly. The test here is a bit tricky:
+	 * incremental files occur in subdirectories of base, in pg_global itself,
+	 * and in subdirectories of pg_tblspc only if in-place tablespaces are
+	 * used.
 	 */
-	is_pg_tblspc = !OidIsValid(tsoid) && relative_path != NULL &&
-		strcmp(relative_path, "pg_tblspc") == 0;
-	is_pg_wal = !OidIsValid(tsoid) && relative_path != NULL &&
-		(strcmp(relative_path, "pg_wal") == 0 ||
-		 strncmp(relative_path, "pg_wal/", 7) == 0);
+	if (OidIsValid(tsoid))
+		is_incremental_dir = true;
+	else if (relative_path != NULL)
+	{
+		is_pg_tblspc = strcmp(relative_path, PG_TBLSPC_DIR) == 0;
+		is_pg_wal = (strcmp(relative_path, "pg_wal") == 0 ||
+					 strncmp(relative_path, "pg_wal/", 7) == 0);
+		is_incremental_dir = strncmp(relative_path, "base/", 5) == 0 ||
+			strcmp(relative_path, "global") == 0 ||
+			strncmp(relative_path, PG_TBLSPC_DIR_SLASH, 10) == 0;
+	}
 
 	/*
 	 * If we're under pg_wal, then we don't need checksums, because these
@@ -839,7 +895,7 @@ process_directory_recursively(Oid tsoid,
 		strlcpy(ifulldir, input_directory, MAXPGPATH);
 		strlcpy(ofulldir, output_directory, MAXPGPATH);
 		if (OidIsValid(tsoid))
-			snprintf(manifest_prefix, MAXPGPATH, "pg_tblspc/%u/", tsoid);
+			snprintf(manifest_prefix, MAXPGPATH, "%s/%u/", PG_TBLSPC_DIR, tsoid);
 		else
 			manifest_prefix[0] = '\0';
 	}
@@ -850,8 +906,8 @@ process_directory_recursively(Oid tsoid,
 		snprintf(ofulldir, MAXPGPATH, "%s/%s", output_directory,
 				 relative_path);
 		if (OidIsValid(tsoid))
-			snprintf(manifest_prefix, MAXPGPATH, "pg_tblspc/%u/%s/",
-					 tsoid, relative_path);
+			snprintf(manifest_prefix, MAXPGPATH, "%s/%u/%s/",
+					 PG_TBLSPC_DIR, tsoid, relative_path);
 		else
 			snprintf(manifest_prefix, MAXPGPATH, "%s/", relative_path);
 	}
@@ -955,7 +1011,8 @@ process_directory_recursively(Oid tsoid,
 		 * If it's an incremental file, hand it off to the reconstruction
 		 * code, which will figure out what to do.
 		 */
-		if (strncmp(de->d_name, INCREMENTAL_PREFIX,
+		if (is_incremental_dir &&
+			strncmp(de->d_name, INCREMENTAL_PREFIX,
 					INCREMENTAL_PREFIX_LENGTH) == 0)
 		{
 			/* Output path should not include "INCREMENTAL." prefix. */
@@ -969,7 +1026,7 @@ process_directory_recursively(Oid tsoid,
 
 			/* Reconstruction logic will do the rest. */
 			reconstruct_from_incremental_file(ifullpath, ofullpath,
-											  relative_path,
+											  manifest_prefix,
 											  de->d_name + INCREMENTAL_PREFIX_LENGTH,
 											  n_prior_backups,
 											  prior_backup_dirs,
@@ -1013,7 +1070,7 @@ process_directory_recursively(Oid tsoid,
 					 */
 					bmpath = psprintf("%s/%s", input_directory,
 									  "backup_manifest");
-					pg_log_warning("\"%s\" contains no entry for \"%s\"",
+					pg_log_warning("manifest file \"%s\" contains no entry for file \"%s\"",
 								   bmpath, manifest_path);
 					pfree(bmpath);
 				}
@@ -1115,7 +1172,7 @@ read_pg_version_file(char *directory)
 
 	/* Close the file. */
 	if (close(fd) != 0)
-		pg_fatal("could not close \"%s\": %m", filename);
+		pg_fatal("could not close file \"%s\": %m", filename);
 
 	/* Convert to integer. */
 	errno = 0;
@@ -1129,12 +1186,12 @@ read_pg_version_file(char *directory)
 		 * out.
 		 */
 		if (version < 10 && *ep == '.')
-			pg_fatal("%s: server version too old\n", filename);
-		pg_fatal("%s: could not parse version number\n", filename);
+			pg_fatal("%s: server version too old", filename);
+		pg_fatal("%s: could not parse version number", filename);
 	}
 
 	/* Debugging output. */
-	pg_log_debug("read server version %d from \"%s\"", version, filename);
+	pg_log_debug("read server version %d from file \"%s\"", version, filename);
 
 	/* Release memory and return result. */
 	pfree(buf.data);
@@ -1156,7 +1213,7 @@ remember_to_cleanup_directory(char *target_path, bool rmtopdir)
 }
 
 /*
- * Empty out the list of directories scheduled for cleanup a exit.
+ * Empty out the list of directories scheduled for cleanup at exit.
  *
  * We want to remove the output directories only on a failure, so call this
  * function when we know that the operation has succeeded.
@@ -1192,7 +1249,7 @@ scan_for_existing_tablespaces(char *pathname, cb_options *opt)
 	struct dirent *de;
 	cb_tablespace *tslist = NULL;
 
-	snprintf(pg_tblspc, MAXPGPATH, "%s/pg_tblspc", pathname);
+	snprintf(pg_tblspc, MAXPGPATH, "%s/%s", pathname, PG_TBLSPC_DIR);
 	pg_log_debug("scanning \"%s\"", pg_tblspc);
 
 	if ((dir = opendir(pg_tblspc)) == NULL)
@@ -1252,10 +1309,10 @@ scan_for_existing_tablespaces(char *pathname, cb_options *opt)
 				pg_fatal("could not read symbolic link \"%s\": %m",
 						 tblspcdir);
 			if (link_length >= sizeof(link_target))
-				pg_fatal("symbolic link \"%s\" is too long", tblspcdir);
+				pg_fatal("target of symbolic link \"%s\" is too long", tblspcdir);
 			link_target[link_length] = '\0';
 			if (!is_absolute_path(link_target))
-				pg_fatal("symbolic link \"%s\" is relative", tblspcdir);
+				pg_fatal("target of symbolic link \"%s\" is relative", tblspcdir);
 
 			/* Canonicalize the link target. */
 			canonicalize_path(link_target);
@@ -1287,15 +1344,15 @@ scan_for_existing_tablespaces(char *pathname, cb_options *opt)
 			 * we just record the paths within the data directories.
 			 */
 			snprintf(ts->old_dir, MAXPGPATH, "%s/%s", pg_tblspc, de->d_name);
-			snprintf(ts->new_dir, MAXPGPATH, "%s/pg_tblspc/%s", opt->output,
-					 de->d_name);
+			snprintf(ts->new_dir, MAXPGPATH, "%s/%s/%s", opt->output,
+					 PG_TBLSPC_DIR, de->d_name);
 			ts->in_place = true;
 		}
 
 		/* Tablespaces should not share a directory. */
 		for (otherts = tslist; otherts != NULL; otherts = otherts->next)
 			if (strcmp(ts->new_dir, otherts->new_dir) == 0)
-				pg_fatal("tablespaces with OIDs %u and %u both point at \"%s\"",
+				pg_fatal("tablespaces with OIDs %u and %u both point at directory \"%s\"",
 						 otherts->oid, oid, ts->new_dir);
 
 		/* Add this tablespace to the list. */
@@ -1323,7 +1380,7 @@ slurp_file(int fd, char *filename, StringInfo buf, int maxlen)
 
 	/* Check file size, and complain if it's too large. */
 	if (fstat(fd, &st) != 0)
-		pg_fatal("could not stat \"%s\": %m", filename);
+		pg_fatal("could not stat file \"%s\": %m", filename);
 	if (st.st_size > maxlen)
 		pg_fatal("file \"%s\" is too large", filename);
 
@@ -1342,7 +1399,7 @@ slurp_file(int fd, char *filename, StringInfo buf, int maxlen)
 		if (rb < 0)
 			pg_fatal("could not read file \"%s\": %m", filename);
 		else
-			pg_fatal("could not read file \"%s\": read only %zd of %lld bytes",
+			pg_fatal("could not read file \"%s\": read %zd of %lld",
 					 filename, rb, (long long int) st.st_size);
 	}
 

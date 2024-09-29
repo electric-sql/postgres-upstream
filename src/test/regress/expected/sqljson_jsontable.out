@@ -9,12 +9,12 @@ SELECT * FROM JSON_TABLE('[]', 'strict $.a' COLUMNS (js2 int PATH '$') DEFAULT 1
 ERROR:  invalid ON ERROR behavior
 LINE 1: ...BLE('[]', 'strict $.a' COLUMNS (js2 int PATH '$') DEFAULT 1 ...
                                                              ^
-DETAIL:  Only EMPTY or ERROR is allowed in the top-level ON ERROR clause.
+DETAIL:  Only EMPTY [ ARRAY ] or ERROR is allowed in the top-level ON ERROR clause.
 SELECT * FROM JSON_TABLE('[]', 'strict $.a' COLUMNS (js2 int PATH '$') NULL ON ERROR);
 ERROR:  invalid ON ERROR behavior
 LINE 1: ...BLE('[]', 'strict $.a' COLUMNS (js2 int PATH '$') NULL ON ER...
                                                              ^
-DETAIL:  Only EMPTY or ERROR is allowed in the top-level ON ERROR clause.
+DETAIL:  Only EMPTY [ ARRAY ] or ERROR is allowed in the top-level ON ERROR clause.
 SELECT * FROM JSON_TABLE('[]', 'strict $.a' COLUMNS (js2 int PATH '$') EMPTY ON ERROR);
  js2 
 -----
@@ -103,14 +103,14 @@ FROM json_table_test vals
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  1 |   1 | 1       | 1       | t    |       1 | 1       | 1            | 1
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  2 |     | 1.23    | 1.23    |      |    1.23 | 1.23    | 1.23         | 1.23
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  3 |   2 | 2       | 2       |      |       2 | 2       | "2"          | "2"
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  4 |     | aaaaaaa | aaaa    |      |         | aaaaaaa | "aaaaaaa"    | "aaaaaaa"
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  4 |     | aaaaaaa |         |      |         | aaaaaaa | "aaaaaaa"    | "aaaaaaa"
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  5 |     | foo     | foo     |      |         |         | "foo"        | "foo"
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  6 |     |         |         |      |         |         | null         | null
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  7 |     | f       | f       | f    |         | f       | false        | false
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  8 |     | t       | t       | t    |         | t       | true         | true
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  7 |     | f       | f       | f    |         | false   | false        | false
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  8 |     | t       | t       | t    |         | true    | true         | true
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  9 |     |         |         |      |         |         | {"aaa": 123} | {"aaa": 123}
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 10 |     | [1,2]   | [1,2    |      |         | [1,2]   | "[1,2]"      | "[1,2]"
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 11 |     | "str"   | "str    |      |         | "str"   | "\"str\""    | "\"str\""
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 10 |     | [1,2]   |         |      |         | [1,2]   | "[1,2]"      | "[1,2]"
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 11 |     | "str"   |         |      |         | "str"   | "\"str\""    | "\"str\""
 (14 rows)
 
 -- "formatted" columns
@@ -137,14 +137,14 @@ FROM json_table_test vals
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  1 | 1            | 1    | 1    | 1            | 1
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  2 | 1.23         | 1.23 | 1.23 | 1.23         | 1.23
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  3 | "2"          | "2"  | "2"  | "2"          | 2
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  4 | "aaaaaaa"    | "aaa | "aaa | "aaaaaaa"    | 
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  5 | "foo"        | "foo | "foo | "foo"        | 
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  4 | "aaaaaaa"    |      |      | "aaaaaaa"    | 
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  5 | "foo"        |      |      | "foo"        | 
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  6 | null         | null | null | null         | null
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  7 | false        | fals | fals | false        | false
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  7 | false        |      |      | false        | false
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  8 | true         | true | true | true         | true
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  9 | {"aaa": 123} | {"aa | {"aa | {"aaa": 123} | {"aaa": 123}
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 10 | "[1,2]"      | "[1, | "[1, | "[1,2]"      | [1, 2]
- [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 11 | "\"str\""    | "\"s | "\"s | "\"str\""    | "str"
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] |  9 | {"aaa": 123} |      |      | {"aaa": 123} | {"aaa": 123}
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 10 | "[1,2]"      |      |      | "[1,2]"      | [1, 2]
+ [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 11 | "\"str\""    |      |      | "\"str\""    | "str"
 (14 rows)
 
 -- EXISTS columns
@@ -216,6 +216,39 @@ FROM json_table_test vals
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 10 |     |      | "[1,2]"      | ["[1,2]"]      | [1, 2]       |    |    | 
  [1, 1.23, "2", "aaaaaaa", "foo", null, false, true, {"aaa": 123}, "[1,2]", "\"str\""] | 11 |     |      | "\"str\""    | ["\"str\""]    | "str"        |    |    | 
 (14 rows)
+
+-- Test using casts in DEFAULT .. ON ERROR expression
+SELECT * FROM JSON_TABLE(jsonb '{"d1": "H"}', '$'
+    COLUMNS (js1 jsonb_test_domain PATH '$.a2' DEFAULT '"foo1"'::jsonb::text ON EMPTY));
+  js1   
+--------
+ "foo1"
+(1 row)
+
+SELECT * FROM JSON_TABLE(jsonb '{"d1": "H"}', '$'
+    COLUMNS (js1 jsonb_test_domain PATH '$.a2' DEFAULT 'foo'::jsonb_test_domain ON EMPTY));
+ERROR:  could not coerce ON EMPTY expression (DEFAULT) to the RETURNING type
+DETAIL:  value for domain jsonb_test_domain violates check constraint "jsonb_test_domain_check"
+SELECT * FROM JSON_TABLE(jsonb '{"d1": "H"}', '$'
+    COLUMNS (js1 jsonb_test_domain PATH '$.a2' DEFAULT 'foo1'::jsonb_test_domain ON EMPTY));
+ js1  
+------
+ foo1
+(1 row)
+
+SELECT * FROM JSON_TABLE(jsonb '{"d1": "foo"}', '$'
+    COLUMNS (js1 jsonb_test_domain PATH '$.d1' DEFAULT 'foo2'::jsonb_test_domain ON ERROR));
+ js1  
+------
+ foo2
+(1 row)
+
+SELECT * FROM JSON_TABLE(jsonb '{"d1": "foo"}', '$'
+    COLUMNS (js1 oid[] PATH '$.d2' DEFAULT '{1}'::int[]::oid[] ON EMPTY));
+ js1 
+-----
+ {1}
+(1 row)
 
 -- JSON_TABLE: Test backward parsing
 CREATE VIEW jsonb_table_view2 AS
@@ -456,7 +489,7 @@ DROP VIEW jsonb_table_view6;
 DROP DOMAIN jsonb_test_domain;
 -- JSON_TABLE: only one FOR ORDINALITY columns allowed
 SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (id FOR ORDINALITY, id2 FOR ORDINALITY, a int PATH '$.a' ERROR ON EMPTY)) jt;
-ERROR:  cannot use more than one FOR ORDINALITY column
+ERROR:  only one FOR ORDINALITY column is allowed
 LINE 1: ..._TABLE(jsonb '1', '$' COLUMNS (id FOR ORDINALITY, id2 FOR OR...
                                                              ^
 SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (id FOR ORDINALITY, a int PATH '$' ERROR ON EMPTY)) jt;
@@ -492,11 +525,11 @@ FROM
 		ON true;
 ERROR:  invalid input syntax for type integer: "err"
 SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH '$.a' ERROR ON EMPTY)) jt;
-ERROR:  no SQL/JSON item
+ERROR:  no SQL/JSON item found for specified path of column "a"
 SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH 'strict $.a' ERROR ON ERROR) ERROR ON ERROR) jt;
 ERROR:  jsonpath member accessor can only be applied to an object
 SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int PATH 'lax $.a' ERROR ON EMPTY) ERROR ON ERROR) jt;
-ERROR:  no SQL/JSON item
+ERROR:  no SQL/JSON item found for specified path of column "a"
 SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int PATH '$'   DEFAULT 1 ON EMPTY DEFAULT 2 ON ERROR)) jt;
  a 
 ---
@@ -516,38 +549,75 @@ SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int PATH 'lax $.a' DEFAULT 
 (1 row)
 
 -- JSON_TABLE: EXISTS PATH types
-SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int4 EXISTS PATH '$.a'));
+SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int4 EXISTS PATH '$.a' ERROR ON ERROR));	-- ok; can cast to int4
  a 
 ---
  0
 (1 row)
 
+SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int4 EXISTS PATH '$' ERROR ON ERROR));	-- ok; can cast to int4
+ a 
+---
+ 1
+(1 row)
+
 SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int2 EXISTS PATH '$.a'));
-ERROR:  cannot cast type boolean to smallint
-LINE 1: ...ELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int2 EXI...
-                                                             ^
+ERROR:  could not coerce ON ERROR expression (FALSE) to the RETURNING type
+DETAIL:  invalid input syntax for type smallint: "false"
 SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int8 EXISTS PATH '$.a'));
-ERROR:  cannot cast type boolean to bigint
-LINE 1: ...ELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a int8 EXI...
-                                                             ^
+ERROR:  could not coerce ON ERROR expression (FALSE) to the RETURNING type
+DETAIL:  invalid input syntax for type bigint: "false"
 SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a float4 EXISTS PATH '$.a'));
-ERROR:  cannot cast type boolean to real
-LINE 1: ...ELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a float4 E...
-                                                             ^
+ERROR:  could not coerce ON ERROR expression (FALSE) to the RETURNING type
+DETAIL:  invalid input syntax for type real: "false"
+-- Default FALSE (ON ERROR) doesn't fit char(3)
 SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a char(3) EXISTS PATH '$.a'));
-  a  
------
- fal
+ERROR:  could not coerce ON ERROR expression (FALSE) to the RETURNING type
+DETAIL:  value too long for type character(3)
+SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a char(3) EXISTS PATH '$.a' ERROR ON ERROR));
+ERROR:  value too long for type character(3)
+SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a char(5) EXISTS PATH '$.a' ERROR ON ERROR));
+   a   
+-------
+ false
 (1 row)
 
 SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a json EXISTS PATH '$.a'));
-ERROR:  cannot cast type boolean to json
-LINE 1: ...ELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a json EXI...
-                                                             ^
+   a   
+-------
+ false
+(1 row)
+
 SELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a jsonb EXISTS PATH '$.a'));
-ERROR:  cannot cast type boolean to jsonb
-LINE 1: ...ELECT * FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a jsonb EX...
-                                                             ^
+   a   
+-------
+ false
+(1 row)
+
+-- EXISTS PATH domain over int
+CREATE DOMAIN dint4 AS int;
+CREATE DOMAIN dint4_0 AS int CHECK (VALUE <> 0 );
+SELECT a, a::bool FROM JSON_TABLE(jsonb '"a"', '$' COLUMNS (a dint4 EXISTS PATH '$.a' ));
+ a | a 
+---+---
+ 0 | f
+(1 row)
+
+SELECT a, a::bool FROM JSON_TABLE(jsonb '{"a":1}', '$' COLUMNS (a dint4_0 EXISTS PATH '$.b'));
+ERROR:  could not coerce ON ERROR expression (FALSE) to the RETURNING type
+DETAIL:  value for domain dint4_0 violates check constraint "dint4_0_check"
+SELECT a, a::bool FROM JSON_TABLE(jsonb '{"a":1}', '$' COLUMNS (a dint4_0 EXISTS PATH '$.b' ERROR ON ERROR));
+ERROR:  value for domain dint4_0 violates check constraint "dint4_0_check"
+SELECT a, a::bool FROM JSON_TABLE(jsonb '{"a":1}', '$' COLUMNS (a dint4_0 EXISTS PATH '$.b' FALSE ON ERROR));
+ERROR:  could not coerce ON ERROR expression (FALSE) to the RETURNING type
+DETAIL:  value for domain dint4_0 violates check constraint "dint4_0_check"
+SELECT a, a::bool FROM JSON_TABLE(jsonb '{"a":1}', '$' COLUMNS (a dint4_0 EXISTS PATH '$.b' TRUE ON ERROR));
+ a | a 
+---+---
+ 1 | t
+(1 row)
+
+DROP DOMAIN dint4, dint4_0;
 -- JSON_TABLE: WRAPPER/QUOTES clauses on scalar columns
 SELECT * FROM JSON_TABLE(jsonb '"world"', '$' COLUMNS (item text PATH '$' KEEP QUOTES ON SCALAR STRING));
   item   
@@ -637,6 +707,10 @@ SELECT * FROM JSON_TABLE(jsonb '{"a": 123}', '$' || '.' || 'a' COLUMNS (foo int)
 ERROR:  only string constants are supported in JSON_TABLE path specification
 LINE 1: SELECT * FROM JSON_TABLE(jsonb '{"a": 123}', '$' || '.' || '...
                                                      ^
+-- JsonPathQuery() error message mentioning column name
+SELECT * FROM JSON_TABLE('{"a": [{"b": "1"}, {"b": "2"}]}', '$' COLUMNS (b json path '$.a[*].b' ERROR ON ERROR));
+ERROR:  JSON path expression for column "b" should return single item without wrapper
+HINT:  Use the WITH WRAPPER clause to wrap SQL/JSON items into an array.
 -- JSON_TABLE: nested paths
 -- Duplicate path names
 SELECT * FROM JSON_TABLE(
@@ -849,7 +923,16 @@ SELECT sub.* FROM s,
 		xx int path '$.c',
 		NESTED PATH '$.a.za[1]' columns (NESTED PATH '$.z21[*]' COLUMNS (z21 int path '$?(@ >= $"x")' ERROR ON ERROR))
 	)) sub;
-ERROR:  no SQL/JSON item
+ xx | z21  
+----+------
+  3 |     
+  3 |  234
+  3 | 2345
+ 10 |   32
+ 10 |  134
+ 10 | 1345
+(6 rows)
+
 -- Parent columns xx1, xx appear before NESTED ones
 SELECT sub.* FROM s,
 	(VALUES (23)) x(x), generate_series(13, 13) y,
@@ -1022,3 +1105,75 @@ CREATE OR REPLACE VIEW public.jsonb_table_view7 AS
         ) sub
 DROP VIEW jsonb_table_view7;
 DROP TABLE s;
+-- Prevent ON EMPTY specification on EXISTS columns
+SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int exists empty object on empty));
+ERROR:  syntax error at or near "empty"
+LINE 1: ...sonb '1', '$' COLUMNS (a int exists empty object on empty));
+                                                               ^
+-- Test ON ERROR / EMPTY value validity for the function and column types;
+-- all fail
+SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int) NULL ON ERROR);
+ERROR:  invalid ON ERROR behavior
+LINE 1: ... * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int) NULL ON ER...
+                                                             ^
+DETAIL:  Only EMPTY [ ARRAY ] or ERROR is allowed in the top-level ON ERROR clause.
+SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int true on empty));
+ERROR:  invalid ON EMPTY behavior for column "a"
+LINE 1: ...T * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int true on em...
+                                                             ^
+DETAIL:  Only ERROR, NULL, or DEFAULT expression is allowed in ON EMPTY for scalar columns.
+SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int omit quotes true on error));
+ERROR:  invalid ON ERROR behavior for column "a"
+LINE 1: ...N_TABLE(jsonb '1', '$' COLUMNS (a int omit quotes true on er...
+                                                             ^
+DETAIL:  Only ERROR, NULL, EMPTY ARRAY, EMPTY OBJECT, or DEFAULT expression is allowed in ON ERROR for formatted columns.
+SELECT * FROM JSON_TABLE(jsonb '1', '$' COLUMNS (a int exists empty object on error));
+ERROR:  invalid ON ERROR behavior for column "a"
+LINE 1: ...M JSON_TABLE(jsonb '1', '$' COLUMNS (a int exists empty obje...
+                                                             ^
+DETAIL:  Only ERROR, TRUE, FALSE, or UNKNOWN is allowed in ON ERROR for EXISTS columns.
+-- Test JSON_TABLE() column deparsing -- don't emit default ON ERROR / EMPTY
+-- behavior
+CREATE VIEW json_table_view8 AS SELECT * from JSON_TABLE('"a"', '$' COLUMNS (a text PATH '$'));
+\sv json_table_view8;
+CREATE OR REPLACE VIEW public.json_table_view8 AS
+ SELECT a
+   FROM JSON_TABLE(
+            '"a"'::text, '$' AS json_table_path_0
+            COLUMNS (
+                a text PATH '$'
+            )
+        )
+CREATE VIEW json_table_view9 AS SELECT * from JSON_TABLE('"a"', '$' COLUMNS (a text PATH '$') ERROR ON ERROR);
+\sv json_table_view9;
+CREATE OR REPLACE VIEW public.json_table_view9 AS
+ SELECT a
+   FROM JSON_TABLE(
+            '"a"'::text, '$' AS json_table_path_0
+            COLUMNS (
+                a text PATH '$'
+            ) ERROR ON ERROR
+        )
+DROP VIEW json_table_view8, json_table_view9;
+-- Test JSON_TABLE() deparsing -- don't emit default ON ERROR behavior
+CREATE VIEW json_table_view8 AS SELECT * from JSON_TABLE('"a"', '$' COLUMNS (a text PATH '$') EMPTY ON ERROR);
+\sv json_table_view8;
+CREATE OR REPLACE VIEW public.json_table_view8 AS
+ SELECT a
+   FROM JSON_TABLE(
+            '"a"'::text, '$' AS json_table_path_0
+            COLUMNS (
+                a text PATH '$'
+            )
+        )
+CREATE VIEW json_table_view9 AS SELECT * from JSON_TABLE('"a"', '$' COLUMNS (a text PATH '$') EMPTY ARRAY ON ERROR);
+\sv json_table_view9;
+CREATE OR REPLACE VIEW public.json_table_view9 AS
+ SELECT a
+   FROM JSON_TABLE(
+            '"a"'::text, '$' AS json_table_path_0
+            COLUMNS (
+                a text PATH '$'
+            )
+        )
+DROP VIEW json_table_view8, json_table_view9;

@@ -908,11 +908,42 @@ INSERT INTO tbl1 VALUES ($1, $2) \bind 'first value' 'second value' \g
          linkend="protocol-query-concepts"/>) to be used, unlike normal
          <application>psql</application> operation, which uses the simple
          query protocol.  So this command can be useful to test the extended
-         query protocol from psql.  (The extended query protocol is used even
-         if the query has no parameters and this command specifies zero
-         parameters.)  This command affects only the next query executed; all
-         subsequent queries will use the simple query protocol by default.
+         query protocol from <application>psql</application>.  (The extended
+         query protocol is used even if the query has no parameters and this
+         command specifies zero parameters.)  This command affects only the
+         next query executed; all subsequent queries will use the simple query
+         protocol by default.
         </para>
+       </listitem>
+      </varlistentry>
+
+      <varlistentry id="app-psql-meta-command-bind-named">
+       <term><literal>\bind_named</literal> <replaceable class="parameter">statement_name</replaceable> [ <replaceable class="parameter">parameter</replaceable> ] ... </term>
+
+       <listitem>
+        <para>
+         <literal>\bind_named</literal> is equivalent to <literal>\bind</literal>,
+         except that it takes the name of an existing prepared statement as
+         first parameter. An empty string denotes the unnamed prepared
+         statement.
+        </para>
+
+        <para>
+         Example:
+<programlisting>
+INSERT INTO tbls1 VALUES ($1, $2) \parse stmt1
+\bind_named stmt1 'first value' 'second value' \g
+</programlisting>
+        </para>
+
+        <para>
+         This command causes the extended query protocol (see
+         <xref linkend="protocol-query-concepts"/>) to be used, unlike normal
+         <application>psql</application> operation, which uses the simple
+         query protocol. So this command can be useful to test the extended
+         query protocol from <application>psql</application>.
+        </para>
+
        </listitem>
       </varlistentry>
 
@@ -1035,6 +1066,35 @@ INSERT INTO tbl1 VALUES ($1, $2) \bind 'first value' 'second value' \g
         Outputs information about the current database connection.
         </para>
         </listitem>
+      </varlistentry>
+
+      <varlistentry id="app-psql-meta-command-close">
+       <term><literal>\close</literal> <replaceable class="parameter">prepared_statement_name</replaceable></term>
+
+       <listitem>
+        <para>
+         Closes the specified prepared statement. An empty string denotes the
+         unnamed prepared statement. If no prepared statement exists with this
+         name, the operation is a no-op.
+        </para>
+
+        <para>
+         Example:
+<programlisting>
+SELECT $1 \parse stmt1
+\close stmt1
+</programlisting>
+        </para>
+
+        <para>
+         This command causes the extended query protocol to be used,
+         unlike normal <application>psql</application> operation, which
+         uses the simple query protocol. So this command can be useful
+         to test the extended query protocol from
+         <application>psql</application>.
+        </para>
+
+       </listitem>
       </varlistentry>
 
       <varlistentry id="app-psql-meta-commands-copy">
@@ -2779,6 +2839,37 @@ lo_import 152801
         </listitem>
       </varlistentry>
 
+      <varlistentry id="app-psql-meta-command-parse">
+        <term><literal>\parse <replaceable class="parameter">statement_name</replaceable></literal></term>
+        <listitem>
+        <para>
+         Creates a prepared statement from the current query buffer, based on
+         the name of a destination prepared-statement object. An empty string
+         denotes the unnamed prepared statement.
+        </para>
+
+        <para>
+         Example:
+<programlisting>
+SELECT $1 \parse stmt1
+</programlisting>
+        </para>
+
+        <para>
+         This command causes the extended query protocol to be used, unlike
+         normal <application>psql</application> operation, which uses the
+         simple query protocol. A
+         <xref linkend="protocol-message-formats-Parse"/>
+         message will be issued by this command so it can be useful to
+         test the extended query protocol from
+         <application>psql</application>. This command affects only the next
+         query executed; all subsequent queries will use the simple query
+         protocol by default.
+        </para>
+
+        </listitem>
+      </varlistentry>
+
       <varlistentry id="app-psql-meta-command-password">
         <term><literal>\password [ <replaceable class="parameter">username</replaceable> ]</literal></term>
         <listitem>
@@ -4334,7 +4425,8 @@ bar
         When this variable is set to <literal>off</literal>, only the last
         result of a combined query (<literal>\;</literal>) is shown instead of
         all of them.  The default is <literal>on</literal>.  The off behavior
-        is for compatibility with older versions of psql.
+        is for compatibility with older versions of
+        <application>psql</application>.
         </para>
         </listitem>
       </varlistentry>
@@ -5309,9 +5401,9 @@ This second example shows a multiplication table with rows sorted in reverse
 numerical order and columns with an independent, ascending numerical order.
 <programlisting>
 testdb=&gt; <userinput>SELECT t1.first as "A", t2.first+100 AS "B", t1.first*(t2.first+100) as "AxB",</userinput>
-testdb(&gt; <userinput>row_number() over(order by t2.first) AS ord</userinput>
-testdb(&gt; <userinput>FROM my_table t1 CROSS JOIN my_table t2 ORDER BY 1 DESC</userinput>
-testdb(&gt; <userinput>\crosstabview "A" "B" "AxB" ord</userinput>
+testdb-&gt; <userinput>row_number() over(order by t2.first) AS ord</userinput>
+testdb-&gt; <userinput>FROM my_table t1 CROSS JOIN my_table t2 ORDER BY 1 DESC</userinput>
+testdb-&gt; <userinput>\crosstabview "A" "B" "AxB" ord</userinput>
  A | 101 | 102 | 103 | 104
 ---+-----+-----+-----+-----
  4 | 404 | 408 | 412 | 416

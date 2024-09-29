@@ -82,9 +82,6 @@ char	   *GUC_check_errmsg_string;
 char	   *GUC_check_errdetail_string;
 char	   *GUC_check_errhint_string;
 
-/* Kluge: for speed, we examine this GUC variable's value directly */
-extern bool in_hot_standby_guc;
-
 
 /*
  * Unit conversion tables.
@@ -1289,10 +1286,10 @@ find_option(const char *name, bool create_placeholders, bool skip_errors,
 static int
 guc_var_compare(const void *a, const void *b)
 {
-	const struct config_generic *confa = *(struct config_generic *const *) a;
-	const struct config_generic *confb = *(struct config_generic *const *) b;
+	const char *namea = **(const char **const *) a;
+	const char *nameb = **(const char **const *) b;
 
-	return guc_name_compare(confa->name, confb->name);
+	return guc_name_compare(namea, nameb);
 }
 
 /*
@@ -1879,7 +1876,7 @@ SelectConfigFiles(const char *userDoption, const char *progname)
 	else
 	{
 		write_stderr("%s does not know where to find the database system data.\n"
-					 "This can be specified as data_directory in \"%s\", "
+					 "This can be specified as \"data_directory\" in \"%s\", "
 					 "or by the -D invocation option, or by the "
 					 "PGDATA environment variable.\n",
 					 progname, ConfigFileName);
@@ -3173,15 +3170,20 @@ parse_and_validate_value(struct config_generic *record,
 				if (newval->intval < conf->min || newval->intval > conf->max)
 				{
 					const char *unit = get_config_unit_name(conf->gen.flags);
+					const char *unitspace;
+
+					if (unit)
+						unitspace = " ";
+					else
+						unit = unitspace = "";
 
 					ereport(elevel,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("%d%s%s is outside the valid range for parameter \"%s\" (%d .. %d)",
-									newval->intval,
-									unit ? " " : "",
-									unit ? unit : "",
+							 errmsg("%d%s%s is outside the valid range for parameter \"%s\" (%d%s%s .. %d%s%s)",
+									newval->intval, unitspace, unit,
 									name,
-									conf->min, conf->max)));
+									conf->min, unitspace, unit,
+									conf->max, unitspace, unit)));
 					return false;
 				}
 
@@ -3209,15 +3211,20 @@ parse_and_validate_value(struct config_generic *record,
 				if (newval->realval < conf->min || newval->realval > conf->max)
 				{
 					const char *unit = get_config_unit_name(conf->gen.flags);
+					const char *unitspace;
+
+					if (unit)
+						unitspace = " ";
+					else
+						unit = unitspace = "";
 
 					ereport(elevel,
 							(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-							 errmsg("%g%s%s is outside the valid range for parameter \"%s\" (%g .. %g)",
-									newval->realval,
-									unit ? " " : "",
-									unit ? unit : "",
+							 errmsg("%g%s%s is outside the valid range for parameter \"%s\" (%g%s%s .. %g%s%s)",
+									newval->realval, unitspace, unit,
 									name,
-									conf->min, conf->max)));
+									conf->min, unitspace, unit,
+									conf->max, unitspace, unit)));
 					return false;
 				}
 
@@ -3317,10 +3324,12 @@ parse_and_validate_value(struct config_generic *record,
  *
  * Return value:
  *	+1: the value is valid and was successfully applied.
- *	0:	the name or value is invalid (but see below).
- *	-1: the value was not applied because of context, priority, or changeVal.
+ *	0:	the name or value is invalid, or it's invalid to try to set
+ *		this GUC now; but elevel was less than ERROR (see below).
+ *	-1: no error detected, but the value was not applied, either
+ *		because changeVal is false or there is some overriding setting.
  *
- * If there is an error (non-existing option, invalid value) then an
+ * If there is an error (non-existing option, invalid value, etc) then an
  * ereport(ERROR) is thrown *unless* this is called for a source for which
  * we don't want an ERROR (currently, those are defaults, the config file,
  * and per-database or per-user settings, as well as callers who specify
@@ -3383,8 +3392,11 @@ set_config_option_ext(const char *name, const char *value,
 
 
 /*
- * set_config_with_handle: takes an optional 'handle' argument, which can be
- * obtained by the caller from get_config_handle().
+ * set_config_with_handle: sets option `name' to given value.
+ *
+ * This API adds the ability to pass a 'handle' argument, which can be
+ * obtained by the caller from get_config_handle().  NULL has no effect,
+ * but a non-null value avoids the need to search the GUC tables.
  *
  * This should be used by callers which repeatedly set the same config
  * option(s), and want to avoid the overhead of a hash lookup each time.
@@ -3421,23 +3433,6 @@ set_config_with_handle(const char *name, config_handle *handle,
 			elevel = ERROR;
 	}
 
-	/*
-	 * GUC_ACTION_SAVE changes are acceptable during a parallel operation,
-	 * because the current worker will also pop the change.  We're probably
-	 * dealing with a function having a proconfig entry.  Only the function's
-	 * body should observe the change, and peer workers do not share in the
-	 * execution of a function call started by this worker.
-	 *
-	 * Other changes might need to affect other workers, so forbid them.
-	 */
-	if (IsInParallelMode() && changeVal && action != GUC_ACTION_SAVE)
-	{
-		ereport(elevel,
-				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
-				 errmsg("cannot set parameters during a parallel operation")));
-		return -1;
-	}
-
 	/* if handle is specified, no need to look up option */
 	if (!handle)
 	{
@@ -3447,6 +3442,27 @@ set_config_with_handle(const char *name, config_handle *handle,
 	}
 	else
 		record = handle;
+
+	/*
+	 * GUC_ACTION_SAVE changes are acceptable during a parallel operation,
+	 * because the current worker will also pop the change.  We're probably
+	 * dealing with a function having a proconfig entry.  Only the function's
+	 * body should observe the change, and peer workers do not share in the
+	 * execution of a function call started by this worker.
+	 *
+	 * Also allow normal setting if the GUC is marked GUC_ALLOW_IN_PARALLEL.
+	 *
+	 * Other changes might need to affect other workers, so forbid them.
+	 */
+	if (IsInParallelMode() && changeVal && action != GUC_ACTION_SAVE &&
+		(record->flags & GUC_ALLOW_IN_PARALLEL) == 0)
+	{
+		ereport(elevel,
+				(errcode(ERRCODE_INVALID_TRANSACTION_STATE),
+				 errmsg("parameter \"%s\" cannot be set during a parallel operation",
+						name)));
+		return 0;
+	}
 
 	/*
 	 * Check if the option can be set at this time. See guc.h for the precise

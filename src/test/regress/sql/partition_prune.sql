@@ -2,6 +2,25 @@
 -- Test partitioning planner code
 --
 
+-- Helper function which can be used for masking out portions of EXPLAIN
+-- ANALYZE which could contain information that's not consistent on all
+-- platforms.
+create function explain_analyze(query text) returns setof text
+language plpgsql as
+$$
+declare
+    ln text;
+begin
+    for ln in
+        execute format('explain (analyze, costs off, summary off, timing off) %s',
+            query)
+    loop
+        ln := regexp_replace(ln, 'Maximum Storage: \d+', 'Maximum Storage: N');
+        return next ln;
+    end loop;
+end;
+$$;
+
 -- Force generic plans to be used for all prepared statements in this file.
 set plan_cache_mode = force_generic_plan;
 
@@ -607,13 +626,6 @@ set enable_hashjoin = 0;
 set enable_mergejoin = 0;
 set enable_memoize = 0;
 
--- Temporarily install some debugging to investigate plan instability.
-select c.relname,c.relpages,c.reltuples,i.indisvalid,s.autovacuum_count,s.autoanalyze_count
-from pg_class c
-left join pg_stat_all_tables s on c.oid = s.relid
-left join pg_index i on c.oid = i.indexrelid
-where c.relname like 'ab\_%' order by c.relname;
-
 select explain_parallel_append('select avg(ab.a) from ab inner join lprt_a a on ab.a = a.a where a.a in(0, 0, 1)');
 
 -- Ensure the same partitions are pruned when we make the nested loop
@@ -681,24 +693,17 @@ deallocate ab_q4;
 deallocate ab_q5;
 deallocate ab_q6;
 
--- Temporarily install some debugging to investigate plan instability.
-select c.relname,c.relpages,c.reltuples,i.indisvalid,s.autovacuum_count,s.autoanalyze_count
-from pg_class c
-left join pg_stat_all_tables s on c.oid = s.relid
-left join pg_index i on c.oid = i.indexrelid
-where c.relname like 'ab\_%' order by c.relname;
-
 -- UPDATE on a partition subtree has been seen to have problems.
 insert into ab values (1,2);
-explain (analyze, costs off, summary off, timing off)
-update ab_a1 set b = 3 from ab where ab.a = 1 and ab.a = ab_a1.a;
+select explain_analyze('
+update ab_a1 set b = 3 from ab where ab.a = 1 and ab.a = ab_a1.a;');
 table ab;
 
 -- Test UPDATE where source relation has run-time pruning enabled
 truncate ab;
 insert into ab values (1, 1), (1, 2), (1, 3), (2, 1);
-explain (analyze, costs off, summary off, timing off)
-update ab_a1 set b = 3 from ab_a2 where ab_a2.b = (select 1);
+select explain_analyze('
+update ab_a1 set b = 3 from ab_a2 where ab_a2.b = (select 1);');
 select tableoid::regclass, * from ab;
 
 drop table ab, lprt_a;
@@ -1332,3 +1337,5 @@ explain (costs off) select * from hp_contradict_test where a === 1 and b === 1 a
 drop table hp_contradict_test;
 drop operator class part_test_int4_ops2 using hash;
 drop operator ===(int4, int4);
+
+drop function explain_analyze(text);

@@ -42,8 +42,6 @@ my @abi_compatibility_lines;
 my @lines;
 my $abi_compatibility = 0;
 my $section_name;
-my $note;
-my $note_name;
 
 # Remove comments and empty lines and add waitclassname based on the section
 while (<$wait_event_names>)
@@ -181,9 +179,10 @@ if ($gen_code)
 	foreach my $waitclass (sort { uc($a) cmp uc($b) } keys %hashwe)
 	{
 		# Don't generate the pgstat_wait_event.c and wait_event_types.h files
-		# for Extension, LWLock and Lock, these are handled independently.
+		# for types handled independently.
 		next
 		  if ( $waitclass eq 'WaitEventExtension'
+			|| $waitclass eq 'WaitEventInjectionPoint'
 			|| $waitclass eq 'WaitEventLWLock'
 			|| $waitclass eq 'WaitEventLock');
 

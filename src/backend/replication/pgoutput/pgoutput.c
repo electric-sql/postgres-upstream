@@ -404,11 +404,11 @@ parse_output_parameters(List *options, PGOutputData *data)
 	if (!protocol_version_given)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("proto_version option missing"));
+				errmsg("option \"%s\" missing", "proto_version"));
 	if (!publication_names_given)
 		ereport(ERROR,
 				errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-				errmsg("publication_names option missing"));
+				errmsg("option \"%s\" missing", "publication_names"));
 }
 
 /*
@@ -1552,6 +1552,16 @@ cleanup:
 	{
 		RelationClose(ancestor);
 		ancestor = NULL;
+	}
+
+	/* Drop the new slots that were used to store the converted tuples. */
+	if (relentry->attrmap)
+	{
+		if (old_slot)
+			ExecDropSingleTupleTableSlot(old_slot);
+
+		if (new_slot)
+			ExecDropSingleTupleTableSlot(new_slot);
 	}
 
 	MemoryContextSwitchTo(old);

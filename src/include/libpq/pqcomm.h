@@ -86,6 +86,7 @@ is_unixsock_path(const char *path)
 
 #define PG_PROTOCOL_MAJOR(v)	((v) >> 16)
 #define PG_PROTOCOL_MINOR(v)	((v) & 0x0000ffff)
+#define PG_PROTOCOL_FULL(v)	(PG_PROTOCOL_MAJOR(v) * 10000 + PG_PROTOCOL_MINOR(v))
 #define PG_PROTOCOL(m,n)	(((m) << 16) | (n))
 
 /*
@@ -156,8 +157,8 @@ typedef struct CancelRequestPacket
  *
  * The #define can be used to initialize a char[] vector to use directly in the API
  */
-#define PG_ALPN_PROTOCOL "TBD-pgsql"
-#define PG_ALPN_PROTOCOL_VECTOR { 9, 'T','B','D','-','p','g','s','q','l' }
+#define PG_ALPN_PROTOCOL "postgresql"
+#define PG_ALPN_PROTOCOL_VECTOR { 10, 'p','o','s','t','g','r','e','s','q','l' }
 
 /*
  * A client can also start by sending a SSL or GSSAPI negotiation request to

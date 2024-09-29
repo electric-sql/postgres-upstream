@@ -64,9 +64,9 @@
  * supports holdable cursors (the Executor results can be dumped into a
  * tuplestore for access after transaction completion).
  *
- * PORTAL_ONE_RETURNING: the portal contains a single INSERT/UPDATE/DELETE
- * query with a RETURNING clause (plus possibly auxiliary queries added by
- * rule rewriting).  On first execution, we run the portal to completion
+ * PORTAL_ONE_RETURNING: the portal contains a single INSERT/UPDATE/DELETE/
+ * MERGE query with a RETURNING clause (plus possibly auxiliary queries added
+ * by rule rewriting).  On first execution, we run the portal to completion
  * and dump the primary query's results into the portal tuplestore; the
  * results are then returned to the client as demanded.  (We can't support
  * suspension of the query partway through, because the AFTER TRIGGER code
@@ -170,9 +170,9 @@ typedef struct PortalData
 	Snapshot	portalSnapshot; /* active snapshot, or NULL if none */
 
 	/*
-	 * Where we store tuples for a held cursor or a PORTAL_ONE_RETURNING or
-	 * PORTAL_UTIL_SELECT query.  (A cursor held past the end of its
-	 * transaction no longer has any active executor state.)
+	 * Where we store tuples for a held cursor or a PORTAL_ONE_RETURNING,
+	 * PORTAL_ONE_MOD_WITH, or PORTAL_UTIL_SELECT query.  (A cursor held past
+	 * the end of its transaction no longer has any active executor state.)
 	 */
 	Tuplestorestate *holdStore; /* store for holdable cursors */
 	MemoryContext holdContext;	/* memory containing holdStore */

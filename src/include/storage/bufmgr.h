@@ -107,25 +107,17 @@ typedef struct BufferManagerRelation
 #define BMR_REL(p_rel) ((BufferManagerRelation){.rel = p_rel})
 #define BMR_SMGR(p_smgr, p_relpersistence) ((BufferManagerRelation){.smgr = p_smgr, .relpersistence = p_relpersistence})
 
-typedef enum ReadBuffersFlags
-{
-	/* Zero out page if reading fails. */
-	READ_BUFFERS_ZERO_ON_ERROR = (1 << 0),
-
-	/* Call smgrprefetch() if I/O necessary. */
-	READ_BUFFERS_ISSUE_ADVICE = (1 << 1),
-} ReadBuffersFlags;
+/* Zero out page if reading fails. */
+#define READ_BUFFERS_ZERO_ON_ERROR (1 << 0)
+/* Call smgrprefetch() if I/O necessary. */
+#define READ_BUFFERS_ISSUE_ADVICE (1 << 1)
 
 struct ReadBuffersOperation
 {
-	/*
-	 * The following members should be set by the caller.  If only smgr is
-	 * provided without rel, then smgr_persistence can be set to override the
-	 * default assumption of RELPERSISTENCE_PERMANENT.
-	 */
-	Relation	rel;
+	/* The following members should be set by the caller. */
+	Relation	rel;			/* optional */
 	struct SMgrRelationData *smgr;
-	char		smgr_persistence;
+	char		persistence;
 	ForkNumber	forknum;
 	BufferAccessStrategy strategy;
 
@@ -224,7 +216,7 @@ extern bool StartReadBuffer(ReadBuffersOperation *operation,
 							int flags);
 extern bool StartReadBuffers(ReadBuffersOperation *operation,
 							 Buffer *buffers,
-							 BlockNumber blocknum,
+							 BlockNumber blockNum,
 							 int *nblocks,
 							 int flags);
 extern void WaitReadBuffers(ReadBuffersOperation *operation);
@@ -257,7 +249,7 @@ extern Buffer ExtendBufferedRelTo(BufferManagerRelation bmr,
 								  BlockNumber extend_to,
 								  ReadBufferMode mode);
 
-extern void InitBufferPoolAccess(void);
+extern void InitBufferManagerAccess(void);
 extern void AtEOXact_Buffers(bool isCommit);
 extern char *DebugPrintBufferRefcount(Buffer buffer);
 extern void CheckPointBuffers(int flags);
@@ -308,8 +300,8 @@ extern void LimitAdditionalLocalPins(uint32 *additional_pins);
 extern bool EvictUnpinnedBuffer(Buffer buf);
 
 /* in buf_init.c */
-extern void InitBufferPool(void);
-extern Size BufferShmemSize(void);
+extern void BufferManagerShmemInit(void);
+extern Size BufferManagerShmemSize(void);
 
 /* in localbuf.c */
 extern void AtProcExit_LocalBuffers(void);

@@ -196,22 +196,6 @@ INSERT INTO ATACC2 (TEST2) VALUES (3);
 INSERT INTO ATACC1 (TEST2) VALUES (3);
 DROP TABLE ATACC1 CASCADE;
 
--- NOT NULL NO INHERIT
-CREATE TABLE ATACC1 (a int, not null a no inherit);
-CREATE TABLE ATACC2 () INHERITS (ATACC1);
-\d+ ATACC2
-DROP TABLE ATACC1, ATACC2;
-CREATE TABLE ATACC1 (a int);
-ALTER TABLE ATACC1 ADD NOT NULL a NO INHERIT;
-CREATE TABLE ATACC2 () INHERITS (ATACC1);
-\d+ ATACC2
-DROP TABLE ATACC1, ATACC2;
-CREATE TABLE ATACC1 (a int);
-CREATE TABLE ATACC2 () INHERITS (ATACC1);
-ALTER TABLE ATACC1 ADD NOT NULL a NO INHERIT;
-\d+ ATACC2
-DROP TABLE ATACC1, ATACC2;
-
 --
 -- Check constraints on INSERT INTO
 --
@@ -465,6 +449,47 @@ ALTER TABLE parted_fk_naming ATTACH PARTITION parted_fk_naming_1 FOR VALUES IN (
 SELECT conname FROM pg_constraint WHERE conrelid = 'parted_fk_naming_1'::regclass AND contype = 'f';
 DROP TABLE parted_fk_naming;
 
+--
+-- Test various ways to create primary keys on partitions, linked to unique
+-- indexes (without constraints) on the partitioned table.  Ideally these should
+-- fail, but we don't dare change released behavior, so instead cope with it at
+-- DETACH time.
+CREATE TEMP TABLE t (a integer, b integer) PARTITION BY HASH (a, b);
+CREATE TEMP TABLE tp (a integer, b integer, PRIMARY KEY (a, b), UNIQUE (b, a));
+ALTER TABLE t ATTACH PARTITION tp FOR VALUES WITH (MODULUS 1, REMAINDER 0);
+CREATE UNIQUE INDEX t_a_idx ON t (a, b);
+CREATE UNIQUE INDEX t_b_idx ON t (b, a);
+ALTER INDEX t_a_idx ATTACH PARTITION tp_pkey;
+ALTER INDEX t_b_idx ATTACH PARTITION tp_b_a_key;
+SELECT conname, conparentid, conislocal, coninhcount
+  FROM pg_constraint WHERE conname IN ('tp_pkey', 'tp_b_a_key')
+  ORDER BY conname DESC;
+ALTER TABLE t DETACH PARTITION tp;
+DROP TABLE t, tp;
+
+CREATE TEMP TABLE t (a integer) PARTITION BY LIST (a);
+CREATE TEMP TABLE tp (a integer PRIMARY KEY);
+CREATE UNIQUE INDEX t_a_idx ON t (a);
+ALTER TABLE t ATTACH PARTITION tp FOR VALUES IN (1);
+ALTER TABLE t DETACH PARTITION tp;
+DROP TABLE t, tp;
+
+CREATE TEMP TABLE t (a integer) PARTITION BY LIST (a);
+CREATE TEMP TABLE tp (a integer PRIMARY KEY);
+CREATE UNIQUE INDEX t_a_idx ON ONLY t (a);
+ALTER TABLE t ATTACH PARTITION tp FOR VALUES IN (1);
+ALTER TABLE t DETACH PARTITION tp;
+DROP TABLE t, tp;
+
+CREATE TABLE regress_constr_partitioned (a integer) PARTITION BY LIST (a);
+CREATE TABLE regress_constr_partition1 PARTITION OF regress_constr_partitioned FOR VALUES IN (1);
+ALTER TABLE regress_constr_partition1 ADD PRIMARY KEY (a);
+CREATE UNIQUE INDEX ON regress_constr_partitioned (a);
+BEGIN;
+ALTER TABLE regress_constr_partitioned DETACH PARTITION regress_constr_partition1;
+ROLLBACK;
+--  Leave this one in funny state for pg_upgrade testing
+
 -- test a HOT update that invalidates the conflicting tuple.
 -- the trigger should still fire and catch the violation
 
@@ -571,142 +596,6 @@ UPDATE deferred_excl SET f1 = 3;
 ALTER TABLE deferred_excl ADD EXCLUDE (f1 WITH =);
 
 DROP TABLE deferred_excl;
-
--- verify constraints created for NOT NULL clauses
-CREATE TABLE notnull_tbl1 (a INTEGER NOT NULL NOT NULL);
-\d+ notnull_tbl1
-select conname, contype, conkey from pg_constraint where conrelid = 'notnull_tbl1'::regclass;
--- no-op
-ALTER TABLE notnull_tbl1 ADD CONSTRAINT nn NOT NULL a;
-\d+ notnull_tbl1
--- duplicate name
-ALTER TABLE notnull_tbl1 ADD COLUMN b INT CONSTRAINT notnull_tbl1_a_not_null NOT NULL;
--- DROP NOT NULL gets rid of both the attnotnull flag and the constraint itself
-ALTER TABLE notnull_tbl1 ALTER a DROP NOT NULL;
-\d notnull_tbl1
-select conname, contype, conkey from pg_constraint where conrelid = 'notnull_tbl1'::regclass;
--- SET NOT NULL puts both back
-ALTER TABLE notnull_tbl1 ALTER a SET NOT NULL;
-\d notnull_tbl1
-select conname, contype, conkey from pg_constraint where conrelid = 'notnull_tbl1'::regclass;
--- Doing it twice doesn't create a redundant constraint
-ALTER TABLE notnull_tbl1 ALTER a SET NOT NULL;
-select conname, contype, conkey from pg_constraint where conrelid = 'notnull_tbl1'::regclass;
--- Using the "table constraint" syntax also works
-ALTER TABLE notnull_tbl1 ALTER a DROP NOT NULL;
-ALTER TABLE notnull_tbl1 ADD CONSTRAINT foobar NOT NULL a;
-\d notnull_tbl1
-select conname, contype, conkey from pg_constraint where conrelid = 'notnull_tbl1'::regclass;
-DROP TABLE notnull_tbl1;
-
--- nope
-CREATE TABLE notnull_tbl2 (a INTEGER CONSTRAINT blah NOT NULL, b INTEGER CONSTRAINT blah NOT NULL);
-
-CREATE TABLE notnull_tbl2 (a INTEGER PRIMARY KEY);
-ALTER TABLE notnull_tbl2 ALTER a DROP NOT NULL;
-
-CREATE TABLE notnull_tbl3 (a INTEGER NOT NULL, CHECK (a IS NOT NULL));
-ALTER TABLE notnull_tbl3 ALTER A DROP NOT NULL;
-ALTER TABLE notnull_tbl3 ADD b int, ADD CONSTRAINT pk PRIMARY KEY (a, b);
-\d notnull_tbl3
-ALTER TABLE notnull_tbl3 DROP CONSTRAINT pk;
-\d notnull_tbl3
-
--- Primary keys in parent table cause NOT NULL constraint to spawn on their
--- children.  Verify that they work correctly.
-CREATE TABLE cnn_parent (a int, b int);
-CREATE TABLE cnn_child () INHERITS (cnn_parent);
-CREATE TABLE cnn_grandchild (NOT NULL b) INHERITS (cnn_child);
-CREATE TABLE cnn_child2 (NOT NULL a NO INHERIT) INHERITS (cnn_parent);
-CREATE TABLE cnn_grandchild2 () INHERITS (cnn_grandchild, cnn_child2);
-
-ALTER TABLE cnn_parent ADD PRIMARY KEY (b);
-\d+ cnn_grandchild
-\d+ cnn_grandchild2
-ALTER TABLE cnn_parent DROP CONSTRAINT cnn_parent_pkey;
-\set VERBOSITY terse
-DROP TABLE cnn_parent CASCADE;
-\set VERBOSITY default
-
--- As above, but create the primary key ahead of time
-CREATE TABLE cnn_parent (a int, b int PRIMARY KEY);
-CREATE TABLE cnn_child () INHERITS (cnn_parent);
-CREATE TABLE cnn_grandchild (NOT NULL b) INHERITS (cnn_child);
-CREATE TABLE cnn_child2 (NOT NULL a NO INHERIT) INHERITS (cnn_parent);
-CREATE TABLE cnn_grandchild2 () INHERITS (cnn_grandchild, cnn_child2);
-
-ALTER TABLE cnn_parent ADD PRIMARY KEY (b);
-\d+ cnn_grandchild
-\d+ cnn_grandchild2
-ALTER TABLE cnn_parent DROP CONSTRAINT cnn_parent_pkey;
-\set VERBOSITY terse
-DROP TABLE cnn_parent CASCADE;
-\set VERBOSITY default
-
--- As above, but create the primary key using a UNIQUE index
-CREATE TABLE cnn_parent (a int, b int);
-CREATE TABLE cnn_child () INHERITS (cnn_parent);
-CREATE TABLE cnn_grandchild (NOT NULL b) INHERITS (cnn_child);
-CREATE TABLE cnn_child2 (NOT NULL a NO INHERIT) INHERITS (cnn_parent);
-CREATE TABLE cnn_grandchild2 () INHERITS (cnn_grandchild, cnn_child2);
-
-CREATE UNIQUE INDEX b_uq ON cnn_parent (b);
-ALTER TABLE cnn_parent ADD PRIMARY KEY USING INDEX b_uq;
-\d+ cnn_grandchild
-\d+ cnn_grandchild2
-ALTER TABLE cnn_parent DROP CONSTRAINT cnn_parent_pkey;
--- keeps these tables around, for pg_upgrade testing
-
--- A primary key shouldn't attach to a unique constraint
-create table cnn2_parted (a int primary key) partition by list (a);
-create table cnn2_part1 (a int unique);
-alter table cnn2_parted attach partition cnn2_part1 for values in (1);
-\d+ cnn2_part1
-drop table cnn2_parted;
-
--- ensure columns in partitions are marked not-null
-create table cnn2_parted(a int primary key) partition by list (a);
-create table cnn2_part1(a int);
-alter table cnn2_parted attach partition cnn2_part1 for values in (1);
-insert into cnn2_part1 values (null);
-drop table cnn2_parted, cnn2_part1;
-
-create table cnn2_parted(a int not null) partition by list (a);
-create table cnn2_part1(a int primary key);
-alter table cnn2_parted attach partition cnn2_part1 for values in (1);
-drop table cnn2_parted, cnn2_part1;
-
-create table cnn2_parted(a int) partition by list (a);
-create table cnn_part1 partition of cnn2_parted for values in (1, null);
-insert into cnn_part1 values (null);
-alter table cnn2_parted add primary key (a);
-drop table cnn2_parted;
-
--- columns in regular and LIKE inheritance should be marked not-nullable
--- for primary keys, even if those are deferred
-CREATE TABLE notnull_tbl4 (a INTEGER PRIMARY KEY INITIALLY DEFERRED);
-CREATE TABLE notnull_tbl4_lk (LIKE notnull_tbl4);
-CREATE TABLE notnull_tbl4_lk2 (LIKE notnull_tbl4 INCLUDING INDEXES);
-CREATE TABLE notnull_tbl4_lk3 (LIKE notnull_tbl4 INCLUDING INDEXES, CONSTRAINT a_nn NOT NULL a);
-CREATE TABLE notnull_tbl4_cld () INHERITS (notnull_tbl4);
-CREATE TABLE notnull_tbl4_cld2 (PRIMARY KEY (a) DEFERRABLE) INHERITS (notnull_tbl4);
-CREATE TABLE notnull_tbl4_cld3 (PRIMARY KEY (a) DEFERRABLE, CONSTRAINT a_nn NOT NULL a) INHERITS (notnull_tbl4);
-\d+ notnull_tbl4
-\d+ notnull_tbl4_lk
-\d+ notnull_tbl4_lk2
-\d+ notnull_tbl4_lk3
-\d+ notnull_tbl4_cld
-\d+ notnull_tbl4_cld2
-\d+ notnull_tbl4_cld3
--- leave these tables around for pg_upgrade testing
-
--- also, if a NOT NULL is dropped underneath a deferrable PK, the column
--- should still be nullable afterwards.  This mimics what pg_dump does.
-CREATE TABLE notnull_tbl5 (a INTEGER CONSTRAINT a_nn NOT NULL);
-ALTER TABLE notnull_tbl5 ADD PRIMARY KEY (a) DEFERRABLE;
-ALTER TABLE notnull_tbl5 DROP CONSTRAINT a_nn;
-\d+ notnull_tbl5
-DROP TABLE notnull_tbl5;
 
 -- Comments
 -- Setup a low-level role to enforce non-superuser checks.

@@ -70,7 +70,7 @@ static JsonTablePlan *makeJsonTableSiblingJoin(JsonTablePlan *lplan,
  * (jt->context_item) and the column-generating expressions (jt->columns) to
  * populate TableFunc.docexpr and TableFunc.colvalexprs, respectively. Also,
  * the PASSING values (jt->passing) are transformed and added into
- * TableFunc.passvalexprs.
+ * TableFunc.passingvalexprs.
  */
 ParseNamespaceItem *
 transformJsonTable(ParseState *pstate, JsonTable *jt)
@@ -91,8 +91,8 @@ transformJsonTable(ParseState *pstate, JsonTable *jt)
 		jt->on_error->btype != JSON_BEHAVIOR_EMPTY_ARRAY)
 		ereport(ERROR,
 				errcode(ERRCODE_SYNTAX_ERROR),
-				errmsg("invalid ON ERROR behavior"),
-				errdetail("Only EMPTY or ERROR is allowed in the top-level ON ERROR clause."),
+				errmsg("invalid %s behavior", "ON ERROR"),
+				errdetail("Only EMPTY [ ARRAY ] or ERROR is allowed in the top-level ON ERROR clause."),
 				parser_errposition(pstate, jt->on_error->location));
 
 	cxt.pathNameId = 0;
@@ -292,7 +292,7 @@ transformJsonTableColumns(JsonTableParseContext *cxt, List *columns,
 				if (ordinality_found)
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
-							 errmsg("cannot use more than one FOR ORDINALITY column"),
+							 errmsg("only one FOR ORDINALITY column is allowed"),
 							 parser_errposition(pstate, rawc->location)));
 				ordinality_found = true;
 				colexpr = NULL;
@@ -402,18 +402,16 @@ transformJsonTableColumn(JsonTableColumn *jtc, Node *contextItemExpr,
 	Node	   *pathspec;
 	JsonFuncExpr *jfexpr = makeNode(JsonFuncExpr);
 
-	/*
-	 * XXX consider inventing JSON_TABLE_VALUE_OP, etc. and pass the column
-	 * name via JsonExpr so that JsonPathValue(), etc. can provide error
-	 * message tailored to JSON_TABLE(), such as by mentioning the column
-	 * names in the message.
-	 */
 	if (jtc->coltype == JTC_REGULAR)
 		jfexpr->op = JSON_VALUE_OP;
 	else if (jtc->coltype == JTC_EXISTS)
 		jfexpr->op = JSON_EXISTS_OP;
 	else
 		jfexpr->op = JSON_QUERY_OP;
+
+	/* Pass the column name so any runtime JsonExpr errors can print it. */
+	Assert(jtc->name != NULL);
+	jfexpr->column_name = pstrdup(jtc->name);
 
 	jfexpr->context_item = makeJsonValueExpr((Expr *) contextItemExpr, NULL,
 											 makeJsonFormat(JS_FORMAT_DEFAULT,

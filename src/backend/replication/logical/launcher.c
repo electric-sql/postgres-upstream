@@ -272,10 +272,13 @@ logicalrep_worker_find(Oid subid, Oid relid, bool only_running)
  * the subscription, instead of just one.
  */
 List *
-logicalrep_workers_find(Oid subid, bool only_running)
+logicalrep_workers_find(Oid subid, bool only_running, bool acquire_lock)
 {
 	int			i;
 	List	   *res = NIL;
+
+	if (acquire_lock)
+		LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
 
 	Assert(LWLockHeldByMe(LogicalRepWorkerLock));
 
@@ -287,6 +290,9 @@ logicalrep_workers_find(Oid subid, bool only_running)
 		if (w->in_use && w->subid == subid && (!only_running || w->proc))
 			res = lappend(res, w);
 	}
+
+	if (acquire_lock)
+		LWLockRelease(LogicalRepWorkerLock);
 
 	return res;
 }
@@ -331,7 +337,7 @@ logicalrep_worker_launch(LogicalRepWorkerType wtype,
 	if (max_replication_slots == 0)
 		ereport(ERROR,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
-				 errmsg("cannot start logical replication workers when max_replication_slots = 0")));
+				 errmsg("cannot start logical replication workers when \"max_replication_slots\"=0")));
 
 	/*
 	 * We need to do the modification of the shared memory under lock so that
@@ -425,7 +431,7 @@ retry:
 		ereport(WARNING,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("out of logical replication worker slots"),
-				 errhint("You might need to increase %s.", "max_logical_replication_workers")));
+				 errhint("You might need to increase \"%s\".", "max_logical_replication_workers")));
 		return false;
 	}
 
@@ -511,7 +517,7 @@ retry:
 		ereport(WARNING,
 				(errcode(ERRCODE_CONFIGURATION_LIMIT_EXCEEDED),
 				 errmsg("out of background worker slots"),
-				 errhint("You might need to increase %s.", "max_worker_processes")));
+				 errhint("You might need to increase \"%s\".", "max_worker_processes")));
 		return false;
 	}
 
@@ -759,7 +765,7 @@ logicalrep_worker_detach(void)
 
 		LWLockAcquire(LogicalRepWorkerLock, LW_SHARED);
 
-		workers = logicalrep_workers_find(MyLogicalRepWorker->subid, true);
+		workers = logicalrep_workers_find(MyLogicalRepWorker->subid, true, false);
 		foreach(lc, workers)
 		{
 			LogicalRepWorker *w = (LogicalRepWorker *) lfirst(lc);

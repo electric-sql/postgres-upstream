@@ -33,7 +33,7 @@
 typedef struct
 {
 	/*-------------------------------------------------------
-	 * Arguments passed to heap_page_and_freeze()
+	 * Arguments passed to heap_page_prune_and_freeze()
 	 *-------------------------------------------------------
 	 */
 
@@ -306,7 +306,7 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
  * If the HEAP_PRUNE_FREEZE option is set, we will also freeze tuples if it's
  * required in order to advance relfrozenxid / relminmxid, or if it's
  * considered advantageous for overall system performance to do so now.  The
- * 'cutoffs', 'presult', 'new_refrozen_xid' and 'new_relmin_mxid' arguments
+ * 'cutoffs', 'presult', 'new_relfrozen_xid' and 'new_relmin_mxid' arguments
  * are required when freezing.  When HEAP_PRUNE_FREEZE option is set, we also
  * set presult->all_visible and presult->all_frozen on exit, to indicate if
  * the VM bits can be set.  They are always set to false when the
@@ -325,6 +325,8 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
  *
  * cutoffs contains the freeze cutoffs, established by VACUUM at the beginning
  * of vacuuming the relation.  Required if HEAP_PRUNE_FREEZE option is set.
+ * cutoffs->OldestXmin is also used to determine if dead tuples are
+ * HEAPTUPLE_RECENTLY_DEAD or HEAPTUPLE_DEAD.
  *
  * presult contains output parameters needed by callers, such as the number of
  * tuples removed and the offsets of dead items on the page after pruning.
@@ -337,7 +339,7 @@ heap_page_prune_opt(Relation relation, Buffer buffer)
  * off_loc is the offset location required by the caller to use in error
  * callback.
  *
- * new_relfrozen_xid and new_relmin_xid must provided by the caller if the
+ * new_relfrozen_xid and new_relmin_mxid must provided by the caller if the
  * HEAP_PRUNE_FREEZE option is set.  On entry, they contain the oldest XID and
  * multi-XID seen on the relation so far.  They will be updated with oldest
  * values present on the page after pruning.  After processing the whole
@@ -922,8 +924,27 @@ heap_prune_satisfies_vacuum(PruneState *prstate, HeapTuple tup, Buffer buffer)
 	if (res != HEAPTUPLE_RECENTLY_DEAD)
 		return res;
 
+	/*
+	 * For VACUUM, we must be sure to prune tuples with xmax older than
+	 * OldestXmin -- a visibility cutoff determined at the beginning of
+	 * vacuuming the relation. OldestXmin is used for freezing determination
+	 * and we cannot freeze dead tuples' xmaxes.
+	 */
+	if (prstate->cutoffs &&
+		TransactionIdIsValid(prstate->cutoffs->OldestXmin) &&
+		NormalTransactionIdPrecedes(dead_after, prstate->cutoffs->OldestXmin))
+		return HEAPTUPLE_DEAD;
+
+	/*
+	 * Determine whether or not the tuple is considered dead when compared
+	 * with the provided GlobalVisState. On-access pruning does not provide
+	 * VacuumCutoffs. And for vacuum, even if the tuple's xmax is not older
+	 * than OldestXmin, GlobalVisTestIsRemovableXid() could find the row dead
+	 * if the GlobalVisState has been updated since the beginning of vacuuming
+	 * the relation.
+	 */
 	if (GlobalVisTestIsRemovableXid(prstate->vistest, dead_after))
-		res = HEAPTUPLE_DEAD;
+		return HEAPTUPLE_DEAD;
 
 	return res;
 }

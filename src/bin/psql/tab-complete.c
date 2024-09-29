@@ -1713,8 +1713,8 @@ psql_completion(const char *text, int start, int end)
 	/* psql's backslash commands. */
 	static const char *const backslash_commands[] = {
 		"\\a",
-		"\\bind",
-		"\\connect", "\\conninfo", "\\C", "\\cd", "\\copy",
+		"\\bind", "\\bind_named",
+		"\\connect", "\\conninfo", "\\C", "\\cd", "\\close", "\\copy",
 		"\\copyright", "\\crosstabview",
 		"\\d", "\\da", "\\dA", "\\dAc", "\\dAf", "\\dAo", "\\dAp",
 		"\\db", "\\dc", "\\dconfig", "\\dC", "\\dd", "\\ddp", "\\dD",
@@ -1731,7 +1731,7 @@ psql_completion(const char *text, int start, int end)
 		"\\if", "\\include", "\\include_relative", "\\ir",
 		"\\list", "\\lo_import", "\\lo_export", "\\lo_list", "\\lo_unlink",
 		"\\out",
-		"\\password", "\\print", "\\prompt", "\\pset",
+		"\\parse", "\\password", "\\print", "\\prompt", "\\pset",
 		"\\qecho", "\\quit",
 		"\\reset",
 		"\\s", "\\set", "\\setenv", "\\sf", "\\sv",
@@ -1948,7 +1948,7 @@ psql_completion(const char *text, int start, int end)
 	else if (HeadMatches("ALTER", "SUBSCRIPTION", MatchAny) && TailMatches("SET", "("))
 		COMPLETE_WITH("binary", "disable_on_error", "failover", "origin",
 					  "password_required", "run_as_owner", "slot_name",
-					  "streaming", "synchronous_commit");
+					  "streaming", "synchronous_commit", "two_phase");
 	/* ALTER SUBSCRIPTION <name> SKIP ( */
 	else if (HeadMatches("ALTER", "SUBSCRIPTION", MatchAny) && TailMatches("SKIP", "("))
 		COMPLETE_WITH("lsn");
@@ -3253,15 +3253,9 @@ psql_completion(const char *text, int start, int end)
 	/* Complete "CREATE TEMP/TEMPORARY" with the possible temp objects */
 	else if (TailMatches("CREATE", "TEMP|TEMPORARY"))
 		COMPLETE_WITH("SEQUENCE", "TABLE", "VIEW");
-	/* Complete "CREATE UNLOGGED" with TABLE, SEQUENCE or MATVIEW */
+	/* Complete "CREATE UNLOGGED" with TABLE or SEQUENCE */
 	else if (TailMatches("CREATE", "UNLOGGED"))
-	{
-		/* but not MATVIEW in CREATE SCHEMA */
-		if (HeadMatches("CREATE", "SCHEMA"))
-			COMPLETE_WITH("TABLE", "SEQUENCE");
-		else
-			COMPLETE_WITH("TABLE", "SEQUENCE", "MATERIALIZED VIEW");
-	}
+		COMPLETE_WITH("TABLE", "SEQUENCE");
 	/* Complete PARTITION BY with RANGE ( or LIST ( or ... */
 	else if (TailMatches("PARTITION", "BY"))
 		COMPLETE_WITH("RANGE (", "LIST (", "HASH (");
@@ -3856,9 +3850,12 @@ psql_completion(const char *text, int start, int end)
 		 */
 		if (ends_with(prev_wd, '(') || ends_with(prev_wd, ','))
 			COMPLETE_WITH("ANALYZE", "VERBOSE", "COSTS", "SETTINGS", "GENERIC_PLAN",
-						  "BUFFERS", "WAL", "TIMING", "SUMMARY", "FORMAT");
-		else if (TailMatches("ANALYZE|VERBOSE|COSTS|SETTINGS|GENERIC_PLAN|BUFFERS|WAL|TIMING|SUMMARY"))
+						  "BUFFERS", "SERIALIZE", "WAL", "TIMING", "SUMMARY",
+						  "MEMORY", "FORMAT");
+		else if (TailMatches("ANALYZE|VERBOSE|COSTS|SETTINGS|GENERIC_PLAN|BUFFERS|WAL|TIMING|SUMMARY|MEMORY"))
 			COMPLETE_WITH("ON", "OFF");
+		else if (TailMatches("SERIALIZE"))
+			COMPLETE_WITH("TEXT", "NONE", "BINARY");
 		else if (TailMatches("FORMAT"))
 			COMPLETE_WITH("TEXT", "XML", "JSON", "YAML");
 	}

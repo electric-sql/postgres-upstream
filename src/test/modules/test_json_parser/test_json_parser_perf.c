@@ -23,6 +23,7 @@
 
 #include "postgres_fe.h"
 #include "common/jsonapi.h"
+#include "common/logging.h"
 #include "lib/stringinfo.h"
 #include "mb/pg_wchar.h"
 #include <stdio.h>
@@ -42,6 +43,8 @@ main(int argc, char **argv)
 	int			iter;
 	int			use_inc = 0;
 
+	pg_logging_init(argv[0]);
+
 	initStringInfo(&json);
 
 	if (strcmp(argv[1], "-i") == 0)
@@ -52,7 +55,9 @@ main(int argc, char **argv)
 
 	sscanf(argv[1], "%d", &iter);
 
-	json_file = fopen(argv[2], "r");
+	if ((json_file = fopen(argv[2], PG_BINARY_R)) == NULL)
+		pg_fatal("Could not open input file '%s': %m", argv[2]);
+
 	while ((n_read = fread(buff, 1, 6000, json_file)) > 0)
 	{
 		appendBinaryStringInfo(&json, buff, n_read);
@@ -76,12 +81,8 @@ main(int argc, char **argv)
 			freeJsonLexContext(lex);
 		}
 		if (result != JSON_SUCCESS)
-		{
-			fprintf(stderr,
-					"unexpected result %d (expecting %d) on parse\n",
-					result, JSON_SUCCESS);
-			exit(1);
-		}
+			pg_fatal("unexpected result %d (expecting %d) on parse",
+					 result, JSON_SUCCESS);
 	}
 	exit(0);
 }

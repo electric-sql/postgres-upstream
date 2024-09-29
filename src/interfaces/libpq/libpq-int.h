@@ -235,8 +235,7 @@ typedef enum
 #define ENC_ERROR			0
 #define ENC_PLAINTEXT		0x01
 #define ENC_GSSAPI			0x02
-#define ENC_DIRECT_SSL		0x04
-#define ENC_NEGOTIATED_SSL	0x08
+#define ENC_SSL				0x04
 
 /* Target server type (decoded value of target_session_attrs) */
 typedef enum
@@ -332,6 +331,18 @@ typedef enum
 	PGQUERY_CLOSE				/* Close Statement or Portal */
 } PGQueryClass;
 
+
+/*
+ * valid values for pg_conn->current_auth_response.  These are just for
+ * libpq internal use: since authentication response types all use the
+ * protocol byte 'p', fe-trace.c needs a way to distinguish them in order
+ * to print them correctly.
+ */
+#define AUTH_RESPONSE_GSS			'G'
+#define AUTH_RESPONSE_PASSWORD		'P'
+#define AUTH_RESPONSE_SASL_INITIAL	'I'
+#define AUTH_RESPONSE_SASL			'S'
+
 /*
  * An entry in the pending command queue.
  */
@@ -395,8 +406,7 @@ struct pg_conn
 	char	   *keepalives_count;	/* maximum number of TCP keepalive
 									 * retransmits */
 	char	   *sslmode;		/* SSL mode (require,prefer,allow,disable) */
-	char	   *sslnegotiation; /* SSL initiation style
-								 * (postgres,direct,requiredirect) */
+	char	   *sslnegotiation; /* SSL initiation style (postgres,direct) */
 	char	   *sslcompression; /* SSL compression (0 or 1) */
 	char	   *sslkey;			/* client key filename */
 	char	   *sslcert;		/* client certificate filename */
@@ -492,7 +502,9 @@ struct pg_conn
 										 * codes */
 	bool		client_finished_auth;	/* have we finished our half of the
 										 * authentication exchange? */
-
+	char		current_auth_response;	/* used by pqTraceOutputMessage to
+										 * know which auth response we're
+										 * sending */
 
 	/* Transient state needed while establishing connection */
 	PGTargetServerType target_server_type;	/* desired session properties */
@@ -580,11 +592,6 @@ struct pg_conn
 	void	   *engine;			/* dummy field to keep struct the same if
 								 * OpenSSL version changes */
 #endif
-	bool		crypto_loaded;	/* Track if libcrypto locking callbacks have
-								 * been done for this connection. This can be
-								 * removed once support for OpenSSL 1.0.2 is
-								 * removed as this locking is handled
-								 * internally in OpenSSL >= 1.1.0. */
 #endif							/* USE_OPENSSL */
 #endif							/* USE_SSL */
 
@@ -741,6 +748,7 @@ extern PGresult *pqFunctionCall3(PGconn *conn, Oid fnid,
   */
 extern int	pqCheckOutBufferSpace(size_t bytes_needed, PGconn *conn);
 extern int	pqCheckInBufferSpace(size_t bytes_needed, PGconn *conn);
+extern void pqParseDone(PGconn *conn, int newInStart);
 extern int	pqGetc(char *result, PGconn *conn);
 extern int	pqPutc(char c, PGconn *conn);
 extern int	pqGets(PQExpBuffer buf, PGconn *conn);
@@ -757,13 +765,12 @@ extern int	pqReadData(PGconn *conn);
 extern int	pqFlush(PGconn *conn);
 extern int	pqWait(int forRead, int forWrite, PGconn *conn);
 extern int	pqWaitTimed(int forRead, int forWrite, PGconn *conn,
-						time_t finish_time);
+						pg_usec_time_t end_time);
 extern int	pqReadReady(PGconn *conn);
 extern int	pqWriteReady(PGconn *conn);
 
 /* === in fe-secure.c === */
 
-extern int	pqsecure_initialize(PGconn *, bool, bool);
 extern PostgresPollingStatusType pqsecure_open_client(PGconn *);
 extern void pqsecure_close(PGconn *);
 extern ssize_t pqsecure_read(PGconn *, void *ptr, size_t len);
@@ -782,23 +789,6 @@ extern void pq_reset_sigpipe(sigset_t *osigset, bool sigpipe_pending,
 /*
  * The SSL implementation provides these functions.
  */
-
-/*
- *	Implementation of PQinitSSL().
- */
-extern void pgtls_init_library(bool do_ssl, int do_crypto);
-
-/*
- * Initialize SSL library.
- *
- * The conn parameter is only used to be able to pass back an error
- * message - no connection-local setup is made here.  do_ssl controls
- * if SSL is initialized, and do_crypto does the same for the crypto
- * part.
- *
- * Returns 0 if OK, -1 on failure (adding a message to conn->errorMessage).
- */
-extern int	pgtls_init(PGconn *conn, bool do_ssl, bool do_crypto);
 
 /*
  *	Begin or continue negotiating a secure session.
@@ -877,6 +867,8 @@ extern ssize_t pg_GSS_read(PGconn *conn, void *ptr, size_t len);
 extern void pqTraceOutputMessage(PGconn *conn, const char *message,
 								 bool toServer);
 extern void pqTraceOutputNoTypeByteMessage(PGconn *conn, const char *message);
+extern void pqTraceOutputCharResponse(PGconn *conn, const char *responseType,
+									  char response);
 
 /* === miscellaneous macros === */
 

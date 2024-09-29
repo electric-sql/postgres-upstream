@@ -54,7 +54,8 @@ AuxiliaryProcessMainCommon(void)
 
 	init_ps_display(NULL);
 
-	SetProcessingMode(BootstrapProcessing);
+	Assert(GetProcessingMode() == InitProcessing);
+
 	IgnoreSystemIndexes = true;
 
 	/*
@@ -70,7 +71,7 @@ AuxiliaryProcessMainCommon(void)
 
 	BaseInit();
 
-	ProcSignalInit();
+	ProcSignalInit(false, 0);
 
 	/*
 	 * Auxiliary processes don't run transactions, but they may need a

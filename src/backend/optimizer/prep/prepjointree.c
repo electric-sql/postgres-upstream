@@ -153,7 +153,7 @@ transform_MERGE_to_join(Query *parse)
 {
 	RangeTblEntry *joinrte;
 	JoinExpr   *joinexpr;
-	bool		have_action[3];
+	bool		have_action[NUM_MERGE_MATCH_KINDS];
 	JoinType	jointype;
 	int			joinrti;
 	List	   *vars;
@@ -455,8 +455,8 @@ pull_up_sublinks_jointree_recurse(PlannerInfo *root, Node *jtnode,
 		 * point of the available_rels machinations is to ensure that we only
 		 * pull up quals for which that's okay.
 		 *
-		 * We don't expect to see any pre-existing JOIN_SEMI, JOIN_ANTI, or
-		 * JOIN_RIGHT_ANTI jointypes here.
+		 * We don't expect to see any pre-existing JOIN_SEMI, JOIN_ANTI,
+		 * JOIN_RIGHT_SEMI, or JOIN_RIGHT_ANTI jointypes here.
 		 */
 		switch (j->jointype)
 		{
@@ -1235,6 +1235,7 @@ pull_up_simple_subquery(PlannerInfo *root, Node *jtnode, RangeTblEntry *rte,
 				case RTE_CTE:
 				case RTE_NAMEDTUPLESTORE:
 				case RTE_RESULT:
+				case RTE_GROUP:
 					/* these can't contain any lateral references */
 					break;
 			}
@@ -2175,14 +2176,6 @@ perform_pullup_replace_vars(PlannerInfo *root,
 	parse->returningList = (List *)
 		pullup_replace_vars((Node *) parse->returningList, rvcontext);
 
-	foreach(lc, parse->windowClause)
-	{
-		WindowClause *wc = lfirst_node(WindowClause, lc);
-
-		if (wc->runCondition != NIL)
-			wc->runCondition = (List *)
-				pullup_replace_vars((Node *) wc->runCondition, rvcontext);
-	}
 	if (parse->onConflict)
 	{
 		parse->onConflict->onConflictSet = (List *)
@@ -2226,7 +2219,8 @@ perform_pullup_replace_vars(PlannerInfo *root,
 	}
 
 	/*
-	 * Replace references in the joinaliasvars lists of join RTEs.
+	 * Replace references in the joinaliasvars lists of join RTEs and the
+	 * groupexprs list of group RTE.
 	 */
 	foreach(lc, parse->rtable)
 	{
@@ -2235,6 +2229,10 @@ perform_pullup_replace_vars(PlannerInfo *root,
 		if (otherrte->rtekind == RTE_JOIN)
 			otherrte->joinaliasvars = (List *)
 				pullup_replace_vars((Node *) otherrte->joinaliasvars,
+									rvcontext);
+		else if (otherrte->rtekind == RTE_GROUP)
+			otherrte->groupexprs = (List *)
+				pullup_replace_vars((Node *) otherrte->groupexprs,
 									rvcontext);
 	}
 }
@@ -2301,6 +2299,7 @@ replace_vars_in_jointree(Node *jtnode,
 					case RTE_CTE:
 					case RTE_NAMEDTUPLESTORE:
 					case RTE_RESULT:
+					case RTE_GROUP:
 						/* these shouldn't be marked LATERAL */
 						Assert(false);
 						break;
@@ -2498,14 +2497,48 @@ pullup_replace_vars_callback(Var *var,
 				else
 					wrap = false;
 			}
+			else if (rcon->wrap_non_vars)
+			{
+				/* Caller told us to wrap all non-Vars in a PlaceHolderVar */
+				wrap = true;
+			}
 			else
 			{
 				/*
-				 * Must wrap, either because we need a place to insert
-				 * varnullingrels or because caller told us to wrap
-				 * everything.
+				 * If the node contains Var(s) or PlaceHolderVar(s) of the
+				 * subquery being pulled up, and does not contain any
+				 * non-strict constructs, then instead of adding a PHV on top
+				 * we can add the required nullingrels to those Vars/PHVs.
+				 * (This is fundamentally a generalization of the above cases
+				 * for bare Vars and PHVs.)
+				 *
+				 * This test is somewhat expensive, but it avoids pessimizing
+				 * the plan in cases where the nullingrels get removed again
+				 * later by outer join reduction.
+				 *
+				 * This analysis could be tighter: in particular, a non-strict
+				 * construct hidden within a lower-level PlaceHolderVar is not
+				 * reason to add another PHV.  But for now it doesn't seem
+				 * worth the code to be more exact.
+				 *
+				 * For a LATERAL subquery, we have to check the actual var
+				 * membership of the node, but if it's non-lateral then any
+				 * level-zero var must belong to the subquery.
 				 */
-				wrap = true;
+				if ((rcon->target_rte->lateral ?
+					 bms_overlap(pull_varnos(rcon->root, newnode),
+								 rcon->relids) :
+					 contain_vars_of_level(newnode, 0)) &&
+					!contain_nonstrict_functions(newnode))
+				{
+					/* No wrap needed */
+					wrap = false;
+				}
+				else
+				{
+					/* Else wrap it in a PlaceHolderVar */
+					wrap = true;
+				}
 			}
 
 			if (wrap)
@@ -2526,18 +2559,14 @@ pullup_replace_vars_callback(Var *var,
 		}
 	}
 
-	/* Must adjust varlevelsup if replaced Var is within a subquery */
-	if (var->varlevelsup > 0)
-		IncrementVarSublevelsUp(newnode, var->varlevelsup, 0);
-
-	/* Propagate any varnullingrels into the replacement Var or PHV */
+	/* Propagate any varnullingrels into the replacement expression */
 	if (var->varnullingrels != NULL)
 	{
 		if (IsA(newnode, Var))
 		{
 			Var		   *newvar = (Var *) newnode;
 
-			Assert(newvar->varlevelsup == var->varlevelsup);
+			Assert(newvar->varlevelsup == 0);
 			newvar->varnullingrels = bms_add_members(newvar->varnullingrels,
 													 var->varnullingrels);
 		}
@@ -2545,13 +2574,25 @@ pullup_replace_vars_callback(Var *var,
 		{
 			PlaceHolderVar *newphv = (PlaceHolderVar *) newnode;
 
-			Assert(newphv->phlevelsup == var->varlevelsup);
+			Assert(newphv->phlevelsup == 0);
 			newphv->phnullingrels = bms_add_members(newphv->phnullingrels,
 													var->varnullingrels);
 		}
 		else
-			elog(ERROR, "failed to wrap a non-Var");
+		{
+			/* There should be lower-level Vars/PHVs we can modify */
+			newnode = add_nulling_relids(newnode,
+										 NULL,	/* modify all Vars/PHVs */
+										 var->varnullingrels);
+			/* Assert we did put the varnullingrels into the expression */
+			Assert(bms_is_subset(var->varnullingrels,
+								 pull_varnos(rcon->root, newnode)));
+		}
 	}
+
+	/* Must adjust varlevelsup if replaced Var is within a subquery */
+	if (var->varlevelsup > 0)
+		IncrementVarSublevelsUp(newnode, var->varlevelsup, 0);
 
 	return newnode;
 }
@@ -2958,7 +2999,7 @@ reduce_outer_joins_pass2(Node *jtnode,
 				 * These could only have been introduced by pull_up_sublinks,
 				 * so there's no way that upper quals could refer to their
 				 * righthand sides, and no point in checking.  We don't expect
-				 * to see JOIN_RIGHT_ANTI yet.
+				 * to see JOIN_RIGHT_SEMI or JOIN_RIGHT_ANTI yet.
 				 */
 				break;
 			default:

@@ -1,7 +1,7 @@
 /*-------------------------------------------------------------------------
  *
  * s_lock.c
- *	   Hardware-dependent implementation of spinlocks.
+ *	   Implementation of spinlocks.
  *
  * When waiting for a contended spinlock we loop tightly for awhile, then
  * delay using pg_usleep() and try again.  Preferably, "awhile" should be a
@@ -116,12 +116,7 @@ s_lock(volatile slock_t *lock, const char *file, int line, const char *func)
 void
 s_unlock(volatile slock_t *lock)
 {
-#ifdef TAS_ACTIVE_WORD
-	/* HP's PA-RISC */
-	*TAS_ACTIVE_WORD(lock) = -1;
-#else
 	*lock = 0;
-#endif
 }
 #endif
 

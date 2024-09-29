@@ -281,15 +281,13 @@ extern JsonPathParseResult *parsejsonpath(const char *str, int len,
 extern bool jspConvertRegexFlags(uint32 xflags, int *result,
 								 struct Node *escontext);
 
-
 /*
- * Evaluation of jsonpath
+ * Struct for details about external variables passed into jsonpath executor
  */
-
-/* External variable passed into jsonpath. */
 typedef struct JsonPathVariable
 {
 	char	   *name;
+	int			namelen;		/* strlen(name) as cache for GetJsonPathVar() */
 	Oid			typid;
 	int32		typmod;
 	Datum		value;
@@ -297,13 +295,16 @@ typedef struct JsonPathVariable
 } JsonPathVariable;
 
 
-/* SQL/JSON item */
-extern bool JsonPathExists(Datum jb, JsonPath *path, bool *error, List *vars);
+/* SQL/JSON query functions */
+extern bool JsonPathExists(Datum jb, JsonPath *jp, bool *error, List *vars);
 extern Datum JsonPathQuery(Datum jb, JsonPath *jp, JsonWrapper wrapper,
-						   bool *empty, bool *error, List *vars);
+						   bool *empty, bool *error, List *vars,
+						   const char *column_name);
 extern JsonbValue *JsonPathValue(Datum jb, JsonPath *jp, bool *empty,
-								 bool *error, List *vars);
+								 bool *error, List *vars,
+								 const char *column_name);
 
+/* For JSON_TABLE() */
 extern PGDLLIMPORT const TableFuncRoutine JsonbTableRoutine;
 
 #endif

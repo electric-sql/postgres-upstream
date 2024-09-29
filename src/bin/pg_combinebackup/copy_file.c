@@ -13,6 +13,10 @@
 #ifdef HAVE_COPYFILE_H
 #include <copyfile.h>
 #endif
+#ifdef __linux__
+#include <sys/ioctl.h>
+#include <linux/fs.h>
+#endif
 #include <fcntl.h>
 #include <limits.h>
 #include <sys/stat.h>
@@ -25,10 +29,10 @@
 static void copy_file_blocks(const char *src, const char *dst,
 							 pg_checksum_context *checksum_ctx);
 
-static void copy_file_clone(const char *src, const char *dst,
+static void copy_file_clone(const char *src, const char *dest,
 							pg_checksum_context *checksum_ctx);
 
-static void copy_file_by_range(const char *src, const char *dst,
+static void copy_file_by_range(const char *src, const char *dest,
 							   pg_checksum_context *checksum_ctx);
 
 #ifdef WIN32
@@ -59,9 +63,9 @@ copy_file(const char *src, const char *dst,
 		int			fd;
 
 		if ((fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
-			pg_fatal("could not open \"%s\": %m", src);
+			pg_fatal("could not open file \"%s\": %m", src);
 		if (close(fd) < 0)
-			pg_fatal("could not close \"%s\": %m", src);
+			pg_fatal("could not close file \"%s\": %m", src);
 	}
 
 #ifdef WIN32
@@ -179,10 +183,10 @@ copy_file_blocks(const char *src, const char *dst,
 		if ((wb = write(dest_fd, buffer, rb)) != rb)
 		{
 			if (wb < 0)
-				pg_fatal("could not write file \"%s\": %m", dst);
+				pg_fatal("could not write to file \"%s\": %m", dst);
 			else
-				pg_fatal("could not write file \"%s\": wrote only %d of %d bytes at offset %u",
-						 dst, (int) wb, (int) rb, offset);
+				pg_fatal("could not write to file \"%s\", offset %u: wrote %d of %d",
+						 dst, offset, (int) wb, (int) rb);
 		}
 
 		if (pg_checksum_update(checksum_ctx, buffer, rb) < 0)
@@ -192,7 +196,7 @@ copy_file_blocks(const char *src, const char *dst,
 	}
 
 	if (rb < 0)
-		pg_fatal("could not read file \"%s\": %m", dst);
+		pg_fatal("could not read from file \"%s\": %m", dst);
 
 	pg_free(buffer);
 	close(src_fd);
@@ -214,6 +218,9 @@ copy_file_clone(const char *src, const char *dest,
 		pg_fatal("error while cloning file \"%s\" to \"%s\": %m", src, dest);
 #elif defined(__linux__) && defined(FICLONE)
 	{
+		int			src_fd;
+		int			dest_fd;
+
 		if ((src_fd = open(src, O_RDONLY | PG_BINARY, 0)) < 0)
 			pg_fatal("could not open file \"%s\": %m", src);
 
@@ -228,8 +235,11 @@ copy_file_clone(const char *src, const char *dest,
 			unlink(dest);
 
 			pg_fatal("error while cloning file \"%s\" to \"%s\": %s",
-					 src, dest);
+					 src, dest, strerror(save_errno));
 		}
+
+		close(src_fd);
+		close(dest_fd);
 	}
 #else
 	pg_fatal("file cloning not supported on this platform");
@@ -287,7 +297,7 @@ copy_file_copyfile(const char *src, const char *dst,
 	if (CopyFile(src, dst, true) == 0)
 	{
 		_dosmaperr(GetLastError());
-		pg_fatal("could not copy \"%s\" to \"%s\": %m", src, dst);
+		pg_fatal("could not copy file \"%s\" to \"%s\": %m", src, dst);
 	}
 
 	/* if needed, calculate checksum of the file */

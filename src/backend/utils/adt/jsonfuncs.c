@@ -18,6 +18,7 @@
 
 #include "access/htup_details.h"
 #include "catalog/pg_type.h"
+#include "common/int.h"
 #include "common/jsonapi.h"
 #include "common/string.h"
 #include "fmgr.h"
@@ -86,7 +87,7 @@ typedef struct GetState
 {
 	JsonLexContext *lex;
 	text	   *tresult;
-	char	   *result_start;
+	const char *result_start;
 	bool		normalize_results;
 	bool		next_scalar;
 	int			npath;			/* length of each path-related array */
@@ -111,7 +112,7 @@ typedef struct EachState
 	Tuplestorestate *tuple_store;
 	TupleDesc	ret_tdesc;
 	MemoryContext tmp_cxt;
-	char	   *result_start;
+	const char *result_start;
 	bool		normalize_results;
 	bool		next_scalar;
 	char	   *normalized_scalar;
@@ -125,7 +126,7 @@ typedef struct ElementsState
 	Tuplestorestate *tuple_store;
 	TupleDesc	ret_tdesc;
 	MemoryContext tmp_cxt;
-	char	   *result_start;
+	const char *result_start;
 	bool		normalize_results;
 	bool		next_scalar;
 	char	   *normalized_scalar;
@@ -138,7 +139,7 @@ typedef struct JHashState
 	const char *function_name;
 	HTAB	   *hash;
 	char	   *saved_scalar;
-	char	   *save_json_start;
+	const char *save_json_start;
 	JsonTokenType saved_token_type;
 } JHashState;
 
@@ -247,7 +248,7 @@ typedef struct PopulateRecordsetState
 	const char *function_name;
 	HTAB	   *json_hash;
 	char	   *saved_scalar;
-	char	   *save_json_start;
+	const char *save_json_start;
 	JsonTokenType saved_token_type;
 	Tuplestorestate *tuple_store;
 	HeapTupleHeader rec;
@@ -273,7 +274,7 @@ typedef struct PopulateArrayState
 {
 	JsonLexContext *lex;		/* json lexer */
 	PopulateArrayContext *ctx;	/* context */
-	char	   *element_start;	/* start of the current array element */
+	const char *element_start;	/* start of the current array element */
 	char	   *element_scalar; /* current array element token if it is a
 								 * scalar */
 	JsonTokenType element_type; /* current array element type */
@@ -295,7 +296,7 @@ typedef struct JsValue
 	{
 		struct
 		{
-			char	   *str;	/* json string */
+			const char *str;	/* json string */
 			int			len;	/* json string length or -1 if null-terminated */
 			JsonTokenType type; /* json type */
 		}			json;		/* json value */
@@ -390,7 +391,7 @@ static JsonParseErrorType elements_array_element_end(void *state, bool isnull);
 static JsonParseErrorType elements_scalar(void *state, char *token, JsonTokenType tokentype);
 
 /* turn a json object into a hash table */
-static HTAB *get_json_object_as_hash(char *json, int len, const char *funcname,
+static HTAB *get_json_object_as_hash(const char *json, int len, const char *funcname,
 									 Node *escontext);
 
 /* semantic actions for populate_array_json */
@@ -447,16 +448,17 @@ static Datum populate_composite(CompositeIOData *io, Oid typid,
 								HeapTupleHeader defaultval, JsValue *jsv, bool *isnull,
 								Node *escontext);
 static Datum populate_scalar(ScalarIOData *io, Oid typid, int32 typmod, JsValue *jsv,
-							 bool *isnull, Node *escontext);
+							 bool *isnull, Node *escontext, bool omit_quotes);
 static void prepare_column_cache(ColumnIOData *column, Oid typid, int32 typmod,
 								 MemoryContext mcxt, bool need_scalar);
 static Datum populate_record_field(ColumnIOData *col, Oid typid, int32 typmod,
 								   const char *colname, MemoryContext mcxt, Datum defaultval,
-								   JsValue *jsv, bool *isnull, Node *escontext);
+								   JsValue *jsv, bool *isnull, Node *escontext,
+								   bool omit_scalar_quotes);
 static RecordIOData *allocate_record_info(MemoryContext mcxt, int ncolumns);
 static bool JsObjectGetField(JsObject *obj, char *field, JsValue *jsv);
 static void populate_recordset_record(PopulateRecordsetState *state, JsObject *obj);
-static bool populate_array_json(PopulateArrayContext *ctx, char *json, int len);
+static bool populate_array_json(PopulateArrayContext *ctx, const char *json, int len);
 static bool populate_array_dim_jsonb(PopulateArrayContext *ctx, JsonbValue *jbv,
 									 int ndim);
 static void populate_array_report_expected_array(PopulateArrayContext *ctx, int ndim);
@@ -469,7 +471,7 @@ static Datum populate_array(ArrayIOData *aio, const char *colname,
 							Node *escontext);
 static Datum populate_domain(DomainIOData *io, Oid typid, const char *colname,
 							 MemoryContext mcxt, JsValue *jsv, bool *isnull,
-							 Node *escontext);
+							 Node *escontext, bool omit_quotes);
 
 /* functions supporting jsonb_delete, jsonb_set and jsonb_concat */
 static JsonbValue *IteratorConcat(JsonbIterator **it1, JsonbIterator **it2,
@@ -513,7 +515,7 @@ static JsonParseErrorType transform_string_values_scalar(void *state, char *toke
  * returned when escontext is an ErrorSaveContext).
  */
 bool
-pg_parse_json_or_errsave(JsonLexContext *lex, JsonSemAction *sem,
+pg_parse_json_or_errsave(JsonLexContext *lex, const JsonSemAction *sem,
 						 Node *escontext)
 {
 	JsonParseErrorType result;
@@ -945,7 +947,7 @@ jsonb_array_element(PG_FUNCTION_ARGS)
 	{
 		uint32		nelements = JB_ROOT_COUNT(jb);
 
-		if (-element > nelements)
+		if (pg_abs_s32(element) > nelements)
 			PG_RETURN_NULL();
 		else
 			element += nelements;
@@ -988,7 +990,7 @@ jsonb_array_element_text(PG_FUNCTION_ARGS)
 	{
 		uint32		nelements = JB_ROOT_COUNT(jb);
 
-		if (-element > nelements)
+		if (pg_abs_s32(element) > nelements)
 			PG_RETURN_NULL();
 		else
 			element += nelements;
@@ -1181,7 +1183,7 @@ get_object_end(void *state)
 	if (lex_level == 0 && _state->npath == 0)
 	{
 		/* Special case: return the entire object */
-		char	   *start = _state->result_start;
+		const char *start = _state->result_start;
 		int			len = _state->lex->prev_token_terminator - start;
 
 		_state->tresult = cstring_to_text_with_len(start, len);
@@ -1275,7 +1277,7 @@ get_object_field_end(void *state, char *fname, bool isnull)
 			_state->tresult = (text *) NULL;
 		else
 		{
-			char	   *start = _state->result_start;
+			const char *start = _state->result_start;
 			int			len = _state->lex->prev_token_terminator - start;
 
 			_state->tresult = cstring_to_text_with_len(start, len);
@@ -1337,7 +1339,7 @@ get_array_end(void *state)
 	if (lex_level == 0 && _state->npath == 0)
 	{
 		/* Special case: return the entire array */
-		char	   *start = _state->result_start;
+		const char *start = _state->result_start;
 		int			len = _state->lex->prev_token_terminator - start;
 
 		_state->tresult = cstring_to_text_with_len(start, len);
@@ -1426,7 +1428,7 @@ get_array_element_end(void *state, bool isnull)
 			_state->tresult = (text *) NULL;
 		else
 		{
-			char	   *start = _state->result_start;
+			const char *start = _state->result_start;
 			int			len = _state->lex->prev_token_terminator - start;
 
 			_state->tresult = cstring_to_text_with_len(start, len);
@@ -1463,7 +1465,7 @@ get_scalar(void *state, char *token, JsonTokenType tokentype)
 			 * scalar token, but not whitespace before it.  Probably not worth
 			 * doing our own space-skipping to avoid that.
 			 */
-			char	   *start = _state->lex->input;
+			const char *start = _state->lex->input;
 			int			len = _state->lex->prev_token_terminator - start;
 
 			_state->tresult = cstring_to_text_with_len(start, len);
@@ -2622,7 +2624,8 @@ populate_array_element(PopulateArrayContext *ctx, int ndim, JsValue *jsv)
 									ctx->aio->element_type,
 									ctx->aio->element_typmod,
 									NULL, ctx->mcxt, PointerGetDatum(NULL),
-									jsv, &element_isnull, ctx->escontext);
+									jsv, &element_isnull, ctx->escontext,
+									false);
 	/* Nothing to do on an error. */
 	if (SOFT_ERROR_OCCURRED(ctx->escontext))
 		return false;
@@ -2782,7 +2785,7 @@ populate_array_scalar(void *_state, char *token, JsonTokenType tokentype)
  * Returns false if an error occurs when parsing.
  */
 static bool
-populate_array_json(PopulateArrayContext *ctx, char *json, int len)
+populate_array_json(PopulateArrayContext *ctx, const char *json, int len)
 {
 	PopulateArrayState state;
 	JsonSemAction sem;
@@ -3119,11 +3122,11 @@ populate_composite(CompositeIOData *io,
  */
 static Datum
 populate_scalar(ScalarIOData *io, Oid typid, int32 typmod, JsValue *jsv,
-				bool *isnull, Node *escontext)
+				bool *isnull, Node *escontext, bool omit_quotes)
 {
 	Datum		res;
 	char	   *str = NULL;
-	char	   *json = NULL;
+	const char *json = NULL;
 
 	if (jsv->is_json)
 	{
@@ -3131,15 +3134,6 @@ populate_scalar(ScalarIOData *io, Oid typid, int32 typmod, JsValue *jsv,
 
 		json = jsv->val.json.str;
 		Assert(json);
-		if (len >= 0)
-		{
-			/* Need to copy non-null-terminated string */
-			str = palloc(len + 1 * sizeof(char));
-			memcpy(str, json, len);
-			str[len] = '\0';
-		}
-		else
-			str = json;			/* string is already null-terminated */
 
 		/* If converting to json/jsonb, make string into valid JSON literal */
 		if ((typid == JSONOID || typid == JSONBOID) &&
@@ -3148,18 +3142,32 @@ populate_scalar(ScalarIOData *io, Oid typid, int32 typmod, JsValue *jsv,
 			StringInfoData buf;
 
 			initStringInfo(&buf);
-			escape_json(&buf, str);
-			/* free temporary buffer */
-			if (str != json)
-				pfree(str);
+			if (len >= 0)
+				escape_json_with_len(&buf, json, len);
+			else
+				escape_json(&buf, json);
 			str = buf.data;
+		}
+		else if (len >= 0)
+		{
+			/* create a NUL-terminated version */
+			str = palloc(len + 1);
+			memcpy(str, json, len);
+			str[len] = '\0';
+		}
+		else
+		{
+			/* string is already NUL-terminated */
+			str = unconstify(char *, json);
 		}
 	}
 	else
 	{
 		JsonbValue *jbv = jsv->val.jsonb;
 
-		if (typid == JSONBOID)
+		if (jbv->type == jbvString && omit_quotes)
+			str = pnstrdup(jbv->val.string.val, jbv->val.string.len);
+		else if (typid == JSONBOID)
 		{
 			Jsonb	   *jsonb = JsonbValueToJsonb(jbv); /* directly use jsonb */
 
@@ -3211,7 +3219,8 @@ populate_domain(DomainIOData *io,
 				MemoryContext mcxt,
 				JsValue *jsv,
 				bool *isnull,
-				Node *escontext)
+				Node *escontext,
+				bool omit_quotes)
 {
 	Datum		res;
 
@@ -3222,7 +3231,7 @@ populate_domain(DomainIOData *io,
 		res = populate_record_field(io->base_io,
 									io->base_typid, io->base_typmod,
 									colname, mcxt, PointerGetDatum(NULL),
-									jsv, isnull, escontext);
+									jsv, isnull, escontext, omit_quotes);
 		Assert(!*isnull || SOFT_ERROR_OCCURRED(escontext));
 	}
 
@@ -3335,7 +3344,7 @@ Datum
 json_populate_type(Datum json_val, Oid json_type,
 				   Oid typid, int32 typmod,
 				   void **cache, MemoryContext mcxt,
-				   bool *isnull,
+				   bool *isnull, bool omit_quotes,
 				   Node *escontext)
 {
 	JsValue		jsv = {0};
@@ -3365,10 +3374,22 @@ json_populate_type(Datum json_val, Oid json_type,
 
 		jsv.val.jsonb = &jbv;
 
-		/* fill binary jsonb value pointing to jb */
-		jbv.type = jbvBinary;
-		jbv.val.binary.data = &jsonb->root;
-		jbv.val.binary.len = VARSIZE(jsonb) - VARHDRSZ;
+		if (omit_quotes)
+		{
+			char	   *str = JsonbUnquote(DatumGetJsonbP(json_val));
+
+			/* fill the quote-stripped string */
+			jbv.type = jbvString;
+			jbv.val.string.len = strlen(str);
+			jbv.val.string.val = str;
+		}
+		else
+		{
+			/* fill binary jsonb value pointing to jb */
+			jbv.type = jbvBinary;
+			jbv.val.binary.data = &jsonb->root;
+			jbv.val.binary.len = VARSIZE(jsonb) - VARHDRSZ;
+		}
 	}
 
 	if (*cache == NULL)
@@ -3376,7 +3397,7 @@ json_populate_type(Datum json_val, Oid json_type,
 
 	return populate_record_field(*cache, typid, typmod, NULL, mcxt,
 								 PointerGetDatum(NULL), &jsv, isnull,
-								 escontext);
+								 escontext, omit_quotes);
 }
 
 /* recursively populate a record field or an array element from a json/jsonb value */
@@ -3389,7 +3410,8 @@ populate_record_field(ColumnIOData *col,
 					  Datum defaultval,
 					  JsValue *jsv,
 					  bool *isnull,
-					  Node *escontext)
+					  Node *escontext,
+					  bool omit_scalar_quotes)
 {
 	TypeCat		typcat;
 
@@ -3423,7 +3445,7 @@ populate_record_field(ColumnIOData *col,
 	{
 		case TYPECAT_SCALAR:
 			return populate_scalar(&col->scalar_io, typid, typmod, jsv,
-								   isnull, escontext);
+								   isnull, escontext, omit_scalar_quotes);
 
 		case TYPECAT_ARRAY:
 			return populate_array(&col->io.array, colname, mcxt, jsv,
@@ -3441,7 +3463,7 @@ populate_record_field(ColumnIOData *col,
 
 		case TYPECAT_DOMAIN:
 			return populate_domain(&col->io.domain, typid, colname, mcxt,
-								   jsv, isnull, escontext);
+								   jsv, isnull, escontext, omit_scalar_quotes);
 
 		default:
 			elog(ERROR, "unrecognized type category '%c'", typcat);
@@ -3592,7 +3614,8 @@ populate_record(TupleDesc tupdesc,
 										  nulls[i] ? (Datum) 0 : values[i],
 										  &field,
 										  &nulls[i],
-										  escontext);
+										  escontext,
+										  false);
 	}
 
 	res = heap_form_tuple(tupdesc, values, nulls);
@@ -3784,7 +3807,7 @@ populate_record_worker(FunctionCallInfo fcinfo, const char *funcname,
  * Returns the hash table if the json is parsed successfully, NULL otherwise.
  */
 static HTAB *
-get_json_object_as_hash(char *json, int len, const char *funcname,
+get_json_object_as_hash(const char *json, int len, const char *funcname,
 						Node *escontext)
 {
 	HASHCTL		ctl;
@@ -4788,7 +4811,7 @@ jsonb_delete_idx(PG_FUNCTION_ARGS)
 
 	if (idx < 0)
 	{
-		if (-idx > n)
+		if (pg_abs_s32(idx) > n)
 			idx = n;
 		else
 			idx = n + idx;
@@ -5404,7 +5427,7 @@ setPathArray(JsonbIterator **it, Datum *path_elems, bool *path_nulls,
 
 	if (idx < 0)
 	{
-		if (-idx > nelems)
+		if (pg_abs_s32(idx) > nelems)
 		{
 			/*
 			 * If asked to keep elements position consistent, it's not allowed
@@ -5416,7 +5439,7 @@ setPathArray(JsonbIterator **it, Datum *path_elems, bool *path_nulls,
 						 errmsg("path element at position %d is out of range: %d",
 								level + 1, idx)));
 			else
-				idx = INT_MIN;
+				idx = PG_INT32_MIN;
 		}
 		else
 			idx = nelems + idx;
@@ -5914,7 +5937,7 @@ transform_string_values_scalar(void *state, char *token, JsonTokenType tokentype
 	{
 		text	   *out = _state->action(_state->action_state, token, strlen(token));
 
-		escape_json(_state->strval, text_to_cstring(out));
+		escape_json_text(_state->strval, out);
 	}
 	else
 		appendStringInfoString(_state->strval, token);

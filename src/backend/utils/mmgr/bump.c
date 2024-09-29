@@ -342,8 +342,12 @@ BumpAllocLarge(MemoryContext context, Size size, int flags)
 	randomize_mem((char *) MemoryChunkGetPointer(chunk), size);
 #endif
 
-	/* add the block to the list of allocated blocks */
-	dlist_push_head(&set->blocks, &block->node);
+	/*
+	 * Add the block to the tail of allocated blocks list.  The current block
+	 * is left at the head of the list as it may still have space for
+	 * non-large allocations.
+	 */
+	dlist_push_tail(&set->blocks, &block->node);
 
 #ifdef MEMORY_CONTEXT_CHECKING
 	/* Ensure any padding bytes are marked NOACCESS. */
@@ -501,8 +505,8 @@ BumpAlloc(MemoryContext context, Size size, int flags)
 #endif
 
 	/*
-	 * If requested size exceeds maximum for chunks we hand the the request
-	 * off to BumpAllocLarge().
+	 * If requested size exceeds maximum for chunks we hand the request off to
+	 * BumpAllocLarge().
 	 */
 	if (chunk_size > set->allocChunkLimit)
 		return BumpAllocLarge(context, size, flags);
@@ -612,7 +616,7 @@ BumpBlockFree(BumpContext *set, BumpBlock *block)
 void
 BumpFree(void *pointer)
 {
-	elog(ERROR, "pfree is not supported by the bump memory allocator");
+	elog(ERROR, "%s is not supported by the bump memory allocator", "pfree");
 }
 
 /*
@@ -638,10 +642,9 @@ BumpGetChunkContext(void *pointer)
 }
 
 /*
-* BumpGetChunkSpace
-*		Given a currently-allocated chunk, determine the total space
-*		it occupies (including all memory-allocation overhead).
-*/
+ * BumpGetChunkSpace
+ *		Unsupported.
+ */
 Size
 BumpGetChunkSpace(void *pointer)
 {

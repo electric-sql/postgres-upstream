@@ -127,7 +127,7 @@ InternalIpcSemaphoreCreate(IpcSemaphoreKey semKey, int numSems)
 						 "semaphore sets (SEMMNI), or the system wide maximum number of "
 						 "semaphores (SEMMNS), would be exceeded.  You need to raise the "
 						 "respective kernel parameter.  Alternatively, reduce PostgreSQL's "
-						 "consumption of semaphores by reducing its max_connections parameter.\n"
+						 "consumption of semaphores by reducing its \"max_connections\" parameter.\n"
 						 "The PostgreSQL documentation contains more information about "
 						 "configuring your system for PostgreSQL.") : 0));
 	}
@@ -325,8 +325,7 @@ PGReserveSemaphores(int maxSemas)
 
 	/*
 	 * We must use ShmemAllocUnlocked(), since the spinlock protecting
-	 * ShmemAlloc() won't be ready yet.  (This ordering is necessary when we
-	 * are emulating spinlocks with semaphores.)
+	 * ShmemAlloc() won't be ready yet.
 	 */
 	sharedSemas = (PGSemaphore)
 		ShmemAllocUnlocked(PGSemaphoreShmemSize(maxSemas));

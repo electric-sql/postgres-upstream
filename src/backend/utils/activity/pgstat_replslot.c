@@ -157,8 +157,9 @@ pgstat_drop_replslot(ReplicationSlot *slot)
 {
 	Assert(LWLockHeldByMeInMode(ReplicationSlotAllocationLock, LW_EXCLUSIVE));
 
-	pgstat_drop_entry(PGSTAT_KIND_REPLSLOT, InvalidOid,
-					  ReplicationSlotIndex(slot));
+	if (!pgstat_drop_entry(PGSTAT_KIND_REPLSLOT, InvalidOid,
+						   ReplicationSlotIndex(slot)))
+		pgstat_request_entry_refs_gc();
 }
 
 /*
@@ -192,9 +193,9 @@ pgstat_replslot_to_serialized_name_cb(const PgStat_HashKey *key, const PgStatSha
 	 * isn't allowed to change at this point, we can assume that a slot exists
 	 * at the offset.
 	 */
-	if (!ReplicationSlotName(key->objoid, name))
-		elog(ERROR, "could not find name for replication slot index %u",
-			 key->objoid);
+	if (!ReplicationSlotName(key->objid, name))
+		elog(ERROR, "could not find name for replication slot index %llu",
+			 (unsigned long long) key->objid);
 }
 
 bool
@@ -208,7 +209,7 @@ pgstat_replslot_from_serialized_name_cb(const NameData *name, PgStat_HashKey *ke
 
 	key->kind = PGSTAT_KIND_REPLSLOT;
 	key->dboid = InvalidOid;
-	key->objoid = idx;
+	key->objid = idx;
 
 	return true;
 }

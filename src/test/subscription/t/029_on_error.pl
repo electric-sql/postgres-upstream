@@ -26,10 +26,11 @@ sub test_skip_lsn
 		"SELECT subenabled = FALSE FROM pg_subscription WHERE subname = 'sub'"
 	);
 
-	# Get the finish LSN of the error transaction.
+	# Get the finish LSN of the error transaction, mapping the expected
+	# ERROR with its CONTEXT when retrieving this information.
 	my $contents = slurp_file($node_subscriber->logfile, $offset);
 	$contents =~
-	  qr/processing remote data for replication origin \"pg_\d+\" during message type "INSERT" for replication target relation "public.tbl" in transaction \d+, finished at ([[:xdigit:]]+\/[[:xdigit:]]+)/
+	  qr/conflict detected on relation "public.tbl".*\n.*DETAIL:.* Key already exists in unique index "tbl_pkey", modified by .*origin.* transaction \d+ at .*\n.*Key \(i\)=\(\d+\); existing local tuple .*; remote tuple .*\n.*CONTEXT:.* for replication target relation "public.tbl" in transaction \d+, finished at ([[:xdigit:]]+\/[[:xdigit:]]+)/m
 	  or die "could not get error-LSN";
 	my $lsn = $1;
 
@@ -82,6 +83,7 @@ $node_subscriber->append_conf(
 	'postgresql.conf',
 	qq[
 max_prepared_transactions = 10
+track_commit_timestamp = on
 ]);
 $node_subscriber->start;
 
@@ -92,6 +94,7 @@ $node_publisher->safe_psql(
 	'postgres',
 	qq[
 CREATE TABLE tbl (i INT, t BYTEA);
+ALTER TABLE tbl REPLICA IDENTITY FULL;
 INSERT INTO tbl VALUES (1, NULL);
 ]);
 $node_subscriber->safe_psql(
@@ -143,13 +146,14 @@ COMMIT;
 test_skip_lsn($node_publisher, $node_subscriber,
 	"(2, NULL)", "2", "test skipping transaction");
 
-# Test for PREPARE and COMMIT PREPARED. Insert the same data to tbl and
-# PREPARE the transaction, raising an error. Then skip the transaction.
+# Test for PREPARE and COMMIT PREPARED. Update the data and PREPARE the
+# transaction, raising an error on the subscriber due to violation of the
+# unique constraint on tbl. Then skip the transaction.
 $node_publisher->safe_psql(
 	'postgres',
 	qq[
 BEGIN;
-INSERT INTO tbl VALUES (1, NULL);
+UPDATE tbl SET i = 2;
 PREPARE TRANSACTION 'gtx';
 COMMIT PREPARED 'gtx';
 ]);
@@ -166,7 +170,8 @@ BEGIN;
 INSERT INTO tbl SELECT i, sha256(i::text::bytea) FROM generate_series(1, 10000) s(i);
 COMMIT;
 ]);
-test_skip_lsn($node_publisher, $node_subscriber, "(4, sha256(4::text::bytea))",
+test_skip_lsn($node_publisher, $node_subscriber,
+	"(4, sha256(4::text::bytea))",
 	"4", "test skipping stream-commit");
 
 $result = $node_subscriber->safe_psql('postgres',

@@ -575,6 +575,8 @@ typedef struct WindowFunc
 	List	   *args;
 	/* FILTER expression, if any */
 	Expr	   *aggfilter;
+	/* List of WindowFuncRunConditions to help short-circuit execution */
+	List	   *runCondition pg_node_attr(query_jumble_ignore);
 	/* index of associated WindowClause */
 	Index		winref;
 	/* true if argument list was really '*' */
@@ -584,6 +586,34 @@ typedef struct WindowFunc
 	/* token location, or -1 if unknown */
 	ParseLoc	location;
 } WindowFunc;
+
+/*
+ * WindowFuncRunCondition
+ *
+ * Represents intermediate OpExprs which will be used by WindowAgg to
+ * short-circuit execution.
+ */
+typedef struct WindowFuncRunCondition
+{
+	Expr		xpr;
+
+	/* PG_OPERATOR OID of the operator */
+	Oid			opno;
+	/* OID of collation that operator should use */
+	Oid			inputcollid pg_node_attr(query_jumble_ignore);
+
+	/*
+	 * true of WindowFunc belongs on the left of the resulting OpExpr or false
+	 * if the WindowFunc is on the right.
+	 */
+	bool		wfunc_left;
+
+	/*
+	 * The Expr being compared to the WindowFunc to use in the OpExpr in the
+	 * WindowAgg's runCondition
+	 */
+	Expr	   *arg;
+} WindowFuncRunCondition;
 
 /*
  * MergeSupportFunc
@@ -1641,7 +1671,7 @@ typedef struct JsonReturning
  *
  * The actual value is obtained by evaluating formatted_expr.  raw_expr is
  * only there for displaying the original user-written expression and is not
- * evaluated by ExecInterpExpr() and eval_const_exprs_mutator().
+ * evaluated by ExecInterpExpr() and eval_const_expressions_mutator().
  */
 typedef struct JsonValueExpr
 {
@@ -1756,7 +1786,7 @@ typedef struct JsonBehavior
 	JsonBehaviorType btype;
 	Node	   *expr;
 	bool		coerce;
-	int			location;		/* token location, or -1 if unknown */
+	ParseLoc	location;		/* token location, or -1 if unknown */
 } JsonBehavior;
 
 /*
@@ -1782,13 +1812,16 @@ typedef struct JsonExpr
 
 	JsonExprOp	op;
 
+	char	   *column_name;	/* JSON_TABLE() column name or NULL if this is
+								 * not for a JSON_TABLE() */
+
 	/* jsonb-valued expression to query */
 	Node	   *formatted_expr;
 
 	/* Format of the above expression needed by ruleutils.c */
 	JsonFormat *format;
 
-	/* jsopath-valued expression containing the query pattern */
+	/* jsonpath-valued expression containing the query pattern */
 	Node	   *path_spec;
 
 	/* Expected type/format of the output. */
@@ -1805,13 +1838,7 @@ typedef struct JsonExpr
 	/*
 	 * Information about converting the result of jsonpath functions
 	 * JsonPathQuery() and JsonPathValue() to the RETURNING type.
-	 *
-	 * coercion_expr is a cast expression if the parser can find it for the
-	 * source and the target type.  If not, either use_io_coercion or
-	 * use_json_coercion is set to determine the coercion method to use at
-	 * runtime; see coerceJsonExprOutput() and ExecInitJsonExpr().
 	 */
-	Node	   *coercion_expr;
 	bool		use_io_coercion;
 	bool		use_json_coercion;
 
@@ -1821,11 +1848,11 @@ typedef struct JsonExpr
 	/* KEEP or OMIT QUOTES for singleton scalars returned by JSON_QUERY() */
 	bool		omit_quotes;
 
-	/* JsonExpr's collation, if coercion_expr is NULL. */
+	/* JsonExpr's collation. */
 	Oid			collation;
 
 	/* Original JsonFuncExpr's location */
-	int			location;
+	ParseLoc	location;
 } JsonExpr;
 
 /*
@@ -1966,6 +1993,8 @@ typedef enum MergeMatchKind
 	MERGE_WHEN_NOT_MATCHED_BY_SOURCE,
 	MERGE_WHEN_NOT_MATCHED_BY_TARGET
 } MergeMatchKind;
+
+#define NUM_MERGE_MATCH_KINDS (MERGE_WHEN_NOT_MATCHED_BY_TARGET + 1)
 
 typedef struct MergeAction
 {

@@ -858,8 +858,8 @@ CreatePublication(ParseState *pstate, CreatePublicationStmt *stmt)
 	if (wal_level != WAL_LEVEL_LOGICAL)
 		ereport(WARNING,
 				(errcode(ERRCODE_OBJECT_NOT_IN_PREREQUISITE_STATE),
-				 errmsg("wal_level is insufficient to publish logical changes"),
-				 errhint("Set wal_level to \"logical\" before creating subscriptions.")));
+				 errmsg("\"wal_level\" is insufficient to publish logical changes"),
+				 errhint("Set \"wal_level\" to \"logical\" before creating subscriptions.")));
 
 	return myself;
 }
@@ -1176,21 +1176,13 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 				newrelid = RelationGetRelid(newpubrel->relation);
 
 				/*
-				 * If the new publication has column list, transform it to a
-				 * bitmap too.
+				 * Validate the column list.  If the column list or WHERE
+				 * clause changes, then the validation done here will be
+				 * duplicated inside PublicationAddTables().  The validation
+				 * is cheap enough that that seems harmless.
 				 */
-				if (newpubrel->columns)
-				{
-					ListCell   *lc;
-
-					foreach(lc, newpubrel->columns)
-					{
-						char	   *colname = strVal(lfirst(lc));
-						AttrNumber	attnum = get_attnum(newrelid, colname);
-
-						newcolumns = bms_add_member(newcolumns, attnum);
-					}
-				}
+				newcolumns = pub_collist_validate(newpubrel->relation,
+												  newpubrel->columns);
 
 				/*
 				 * Check if any of the new set of relations matches with the
@@ -1199,7 +1191,7 @@ AlterPublicationTables(AlterPublicationStmt *stmt, HeapTuple tup,
 				 * expressions also match. Same for the column list. Drop the
 				 * rest.
 				 */
-				if (RelationGetRelid(newpubrel->relation) == oldrelid)
+				if (newrelid == oldrelid)
 				{
 					if (equal(oldrelwhereclause, newpubrel->whereClause) &&
 						bms_equal(oldcolumns, newcolumns))

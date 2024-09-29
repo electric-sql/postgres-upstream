@@ -275,6 +275,7 @@ static HTAB *OpClassCache = NULL;
 
 static void RelationCloseCleanup(Relation relation);
 static void RelationDestroyRelation(Relation relation, bool remember_tupdesc);
+static void RelationInvalidateRelation(Relation relation);
 static void RelationClearRelation(Relation relation, bool rebuild);
 
 static void RelationReloadIndexInfo(Relation relation);
@@ -535,8 +536,6 @@ RelationBuildTupleDesc(Relation relation)
 
 	constr = (TupleConstr *) MemoryContextAllocZero(CacheMemoryContext,
 													sizeof(TupleConstr));
-	constr->has_not_null = false;
-	constr->has_generated_stored = false;
 
 	/*
 	 * Form a scan key that selects only user attributes (attnum > 0).
@@ -2513,6 +2512,31 @@ RelationDestroyRelation(Relation relation, bool remember_tupdesc)
 }
 
 /*
+ * RelationInvalidateRelation - mark a relation cache entry as invalid
+ *
+ * An entry that's marked as invalid will be reloaded on next access.
+ */
+static void
+RelationInvalidateRelation(Relation relation)
+{
+	/*
+	 * Make sure smgr and lower levels close the relation's files, if they
+	 * weren't closed already.  If the relation is not getting deleted, the
+	 * next smgr access should reopen the files automatically.  This ensures
+	 * that the low-level file access state is updated after, say, a vacuum
+	 * truncation.
+	 */
+	RelationCloseSmgr(relation);
+
+	/* Free AM cached data, if any */
+	if (relation->rd_amcache)
+		pfree(relation->rd_amcache);
+	relation->rd_amcache = NULL;
+
+	relation->rd_isvalid = false;
+}
+
+/*
  * RelationClearRelation
  *
  *	 Physically blow away a relation cache entry, or reset it and rebuild
@@ -2846,14 +2870,28 @@ RelationFlushRelation(Relation relation)
 		 * New relcache entries are always rebuilt, not flushed; else we'd
 		 * forget the "new" status of the relation.  Ditto for the
 		 * new-relfilenumber status.
-		 *
-		 * The rel could have zero refcnt here, so temporarily increment the
-		 * refcnt to ensure it's safe to rebuild it.  We can assume that the
-		 * current transaction has some lock on the rel already.
 		 */
-		RelationIncrementReferenceCount(relation);
-		RelationClearRelation(relation, true);
-		RelationDecrementReferenceCount(relation);
+		if (IsTransactionState() && relation->rd_droppedSubid == InvalidSubTransactionId)
+		{
+			/*
+			 * The rel could have zero refcnt here, so temporarily increment
+			 * the refcnt to ensure it's safe to rebuild it.  We can assume
+			 * that the current transaction has some lock on the rel already.
+			 */
+			RelationIncrementReferenceCount(relation);
+			RelationClearRelation(relation, true);
+			RelationDecrementReferenceCount(relation);
+		}
+		else
+		{
+			/*
+			 * During abort processing, the current resource owner is not
+			 * valid and we cannot hold a refcnt.  Without a valid
+			 * transaction, RelationClearRelation() would just mark the rel as
+			 * invalid anyway, so we can do the same directly.
+			 */
+			RelationInvalidateRelation(relation);
+		}
 	}
 	else
 	{
@@ -3020,7 +3058,10 @@ RelationCacheInvalidate(bool debug_discard)
 			 * map doesn't involve any access to relcache entries.
 			 */
 			if (RelationIsMapped(relation))
+			{
+				RelationCloseSmgr(relation);
 				RelationInitPhysicalAddr(relation);
+			}
 
 			/*
 			 * Add this entry to list of stuff to rebuild in second pass.
@@ -3727,6 +3768,7 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 {
 	RelFileNumber newrelfilenumber;
 	Relation	pg_class;
+	ItemPointerData otid;
 	HeapTuple	tuple;
 	Form_pg_class classform;
 	MultiXactId minmulti = InvalidMultiXactId;
@@ -3769,11 +3811,12 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 	 */
 	pg_class = table_open(RelationRelationId, RowExclusiveLock);
 
-	tuple = SearchSysCacheCopy1(RELOID,
-								ObjectIdGetDatum(RelationGetRelid(relation)));
+	tuple = SearchSysCacheLockedCopy1(RELOID,
+									  ObjectIdGetDatum(RelationGetRelid(relation)));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "could not find tuple for relation %u",
 			 RelationGetRelid(relation));
+	otid = tuple->t_self;
 	classform = (Form_pg_class) GETSTRUCT(tuple);
 
 	/*
@@ -3893,9 +3936,10 @@ RelationSetNewRelfilenumber(Relation relation, char persistence)
 		classform->relminmxid = minmulti;
 		classform->relpersistence = persistence;
 
-		CatalogTupleUpdate(pg_class, &tuple->t_self, tuple);
+		CatalogTupleUpdate(pg_class, &otid, tuple);
 	}
 
+	UnlockTuple(pg_class, &otid, InplaceUpdateTupleLock);
 	heap_freetuple(tuple);
 
 	table_close(pg_class, RowExclusiveLock);
@@ -4810,46 +4854,18 @@ RelationGetIndexList(Relation relation)
 		result = lappend_oid(result, index->indexrelid);
 
 		/*
-		 * Non-unique or predicate indexes aren't interesting for either oid
-		 * indexes or replication identity indexes, so don't check them.
-		 * Deferred ones are not useful for replication identity either; but
-		 * we do include them if they are PKs.
+		 * Invalid, non-unique, non-immediate or predicate indexes aren't
+		 * interesting for either oid indexes or replication identity indexes,
+		 * so don't check them.
 		 */
-		if (!index->indisunique ||
+		if (!index->indisvalid || !index->indisunique ||
+			!index->indimmediate ||
 			!heap_attisnull(htup, Anum_pg_index_indpred, NULL))
 			continue;
 
-		/*
-		 * Remember primary key index, if any.  We do this only if the index
-		 * is valid; but if the table is partitioned, then we do it even if
-		 * it's invalid.
-		 *
-		 * The reason for returning invalid primary keys for foreign tables is
-		 * because of pg_dump of NOT NULL constraints, and the fact that PKs
-		 * remain marked invalid until the partitions' PKs are attached to it.
-		 * If we make rd_pkindex invalid, then the attnotnull flag is reset
-		 * after the PK is created, which causes the ALTER INDEX ATTACH
-		 * PARTITION to fail with 'column ... is not marked NOT NULL'.  With
-		 * this, dropconstraint_internal() will believe that the columns must
-		 * not have attnotnull reset, so the PKs-on-partitions can be attached
-		 * correctly, until finally the PK-on-parent is marked valid.
-		 *
-		 * Also, this doesn't harm anything, because rd_pkindex is not a
-		 * "real" index anyway, but a RELKIND_PARTITIONED_INDEX.
-		 */
-		if (index->indisprimary &&
-			(index->indisvalid ||
-			 relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE))
-		{
+		/* remember primary key index if any */
+		if (index->indisprimary)
 			pkeyIndex = index->indexrelid;
-			pkdeferrable = !index->indimmediate;
-		}
-
-		if (!index->indimmediate)
-			continue;
-
-		if (!index->indisvalid)
-			continue;
 
 		/* remember explicitly chosen replica index */
 		if (index->indisreplident)
@@ -6793,10 +6809,10 @@ RelationCacheInitFilePostInvalidate(void)
 void
 RelationCacheInitFileRemove(void)
 {
-	const char *tblspcdir = "pg_tblspc";
+	const char *tblspcdir = PG_TBLSPC_DIR;
 	DIR		   *dir;
 	struct dirent *de;
-	char		path[MAXPGPATH + 10 + sizeof(TABLESPACE_VERSION_DIRECTORY)];
+	char		path[MAXPGPATH + sizeof(PG_TBLSPC_DIR) + sizeof(TABLESPACE_VERSION_DIRECTORY)];
 
 	snprintf(path, sizeof(path), "global/%s",
 			 RELCACHE_INIT_FILENAME);

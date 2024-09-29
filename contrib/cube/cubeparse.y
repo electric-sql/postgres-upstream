@@ -14,6 +14,12 @@
 /* All grammar constructs return strings */
 #define YYSTYPE char *
 
+#include "cubeparse.h"
+
+/* silence -Wmissing-variable-declarations */
+extern int cube_yychar;
+extern int cube_yynerrs;
+
 /*
  * Bison doesn't allocate anything that needs to live across parser calls,
  * so we can easily have it use palloc instead of malloc.  This prevents

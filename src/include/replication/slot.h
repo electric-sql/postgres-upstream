@@ -17,6 +17,9 @@
 #include "storage/spin.h"
 #include "replication/walreceiver.h"
 
+/* directory to store replication slot data in */
+#define PG_REPLSLOT_DIR     "pg_replslot"
+
 /*
  * Behaviour of replication slots, upon release or crash.
  *
@@ -229,7 +232,7 @@ extern PGDLLIMPORT ReplicationSlot *MyReplicationSlot;
 
 /* GUCs */
 extern PGDLLIMPORT int max_replication_slots;
-extern PGDLLIMPORT char *standby_slot_names;
+extern PGDLLIMPORT char *synchronized_standby_slots;
 
 /* shmem initialization functions */
 extern Size ReplicationSlotsShmemSize(void);
@@ -243,11 +246,12 @@ extern void ReplicationSlotCreate(const char *name, bool db_specific,
 extern void ReplicationSlotPersist(void);
 extern void ReplicationSlotDrop(const char *name, bool nowait);
 extern void ReplicationSlotDropAcquired(void);
-extern void ReplicationSlotAlter(const char *name, bool failover);
+extern void ReplicationSlotAlter(const char *name, const bool *failover,
+								 const bool *two_phase);
 
 extern void ReplicationSlotAcquire(const char *name, bool nowait);
 extern void ReplicationSlotRelease(void);
-extern void ReplicationSlotCleanup(void);
+extern void ReplicationSlotCleanup(bool synced_only);
 extern void ReplicationSlotSave(void);
 extern void ReplicationSlotMarkDirty(void);
 
@@ -278,7 +282,7 @@ extern void CheckSlotPermissions(void);
 extern ReplicationSlotInvalidationCause
 			GetSlotInvalidationCause(const char *invalidation_reason);
 
-extern bool SlotExistsInStandbySlotNames(const char *slot_name);
+extern bool SlotExistsInSyncStandbySlots(const char *slot_name);
 extern bool StandbySlotsHaveCaughtup(XLogRecPtr wait_for_lsn, int elevel);
 extern void WaitForStandbyConfirmation(XLogRecPtr wait_for_lsn);
 

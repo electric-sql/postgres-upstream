@@ -111,7 +111,7 @@ static void validate_table_rewrite_tags(const char *filtervar, List *taglist);
 static void EventTriggerInvoke(List *fn_oid_list, EventTriggerData *trigdata);
 static const char *stringify_grant_objtype(ObjectType objtype);
 static const char *stringify_adefprivs_objtype(ObjectType objtype);
-static void SetDatatabaseHasLoginEventTriggers(void);
+static void SetDatabaseHasLoginEventTriggers(void);
 
 /*
  * Create an event trigger.
@@ -315,7 +315,7 @@ insert_event_trigger_tuple(const char *trigname, const char *eventname, Oid evtO
 	 * faster lookups in hot codepaths. Set the flag unless already True.
 	 */
 	if (strcmp(eventname, "login") == 0)
-		SetDatatabaseHasLoginEventTriggers();
+		SetDatabaseHasLoginEventTriggers();
 
 	/* Depend on owner. */
 	recordDependencyOnOwner(EventTriggerRelationId, trigoid, evtOwner);
@@ -383,11 +383,12 @@ filter_list_to_array(List *filterlist)
  * current database has on login event triggers.
  */
 void
-SetDatatabaseHasLoginEventTriggers(void)
+SetDatabaseHasLoginEventTriggers(void)
 {
 	/* Set dathasloginevt flag in pg_database */
 	Form_pg_database db;
 	Relation	pg_db = table_open(DatabaseRelationId, RowExclusiveLock);
+	ItemPointerData otid;
 	HeapTuple	tuple;
 
 	/*
@@ -399,16 +400,18 @@ SetDatatabaseHasLoginEventTriggers(void)
 	 */
 	LockSharedObject(DatabaseRelationId, MyDatabaseId, 0, AccessExclusiveLock);
 
-	tuple = SearchSysCacheCopy1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
+	tuple = SearchSysCacheLockedCopy1(DATABASEOID, ObjectIdGetDatum(MyDatabaseId));
 	if (!HeapTupleIsValid(tuple))
 		elog(ERROR, "cache lookup failed for database %u", MyDatabaseId);
+	otid = tuple->t_self;
 	db = (Form_pg_database) GETSTRUCT(tuple);
 	if (!db->dathasloginevt)
 	{
 		db->dathasloginevt = true;
-		CatalogTupleUpdate(pg_db, &tuple->t_self, tuple);
+		CatalogTupleUpdate(pg_db, &otid, tuple);
 		CommandCounterIncrement();
 	}
+	UnlockTuple(pg_db, &otid, InplaceUpdateTupleLock);
 	table_close(pg_db, RowExclusiveLock);
 	heap_freetuple(tuple);
 }
@@ -453,7 +456,7 @@ AlterEventTrigger(AlterEventTrigStmt *stmt)
 	 */
 	if (namestrcmp(&evtForm->evtevent, "login") == 0 &&
 		tgenabled != TRIGGER_DISABLED)
-		SetDatatabaseHasLoginEventTriggers();
+		SetDatabaseHasLoginEventTriggers();
 
 	InvokeObjectPostAlterHook(EventTriggerRelationId,
 							  trigoid, 0);
@@ -925,7 +928,7 @@ EventTriggerOnLogin(void)
 	/*
 	 * There is no active login event trigger, but our
 	 * pg_database.dathasloginevt is set. Try to unset this flag.  We use the
-	 * lock to prevent concurrent SetDatatabaseHasLoginEventTriggers(), but we
+	 * lock to prevent concurrent SetDatabaseHasLoginEventTriggers(), but we
 	 * don't want to hang the connection waiting on the lock.  Thus, we are
 	 * just trying to acquire the lock conditionally.
 	 */
@@ -946,25 +949,18 @@ EventTriggerOnLogin(void)
 		{
 			Relation	pg_db = table_open(DatabaseRelationId, RowExclusiveLock);
 			HeapTuple	tuple;
+			void	   *state;
 			Form_pg_database db;
 			ScanKeyData key[1];
-			SysScanDesc scan;
 
-			/*
-			 * Get the pg_database tuple to scribble on.  Note that this does
-			 * not directly rely on the syscache to avoid issues with
-			 * flattened toast values for the in-place update.
-			 */
+			/* Fetch a copy of the tuple to scribble on */
 			ScanKeyInit(&key[0],
 						Anum_pg_database_oid,
 						BTEqualStrategyNumber, F_OIDEQ,
 						ObjectIdGetDatum(MyDatabaseId));
 
-			scan = systable_beginscan(pg_db, DatabaseOidIndexId, true,
-									  NULL, 1, key);
-			tuple = systable_getnext(scan);
-			tuple = heap_copytuple(tuple);
-			systable_endscan(scan);
+			systable_inplace_update_begin(pg_db, DatabaseOidIndexId, true,
+										  NULL, 1, key, &tuple, &state);
 
 			if (!HeapTupleIsValid(tuple))
 				elog(ERROR, "could not find tuple for database %u", MyDatabaseId);
@@ -980,13 +976,15 @@ EventTriggerOnLogin(void)
 				 * that avoids possible waiting on the row-level lock. Second,
 				 * that avoids dealing with TOAST.
 				 *
-				 * It's known that changes made by heap_inplace_update() may
-				 * be lost due to concurrent normal updates.  However, we are
-				 * OK with that.  The subsequent connections will still have a
-				 * chance to set "dathasloginevt" to false.
+				 * Changes made by inplace update may be lost due to
+				 * concurrent normal updates; see inplace-inval.spec. However,
+				 * we are OK with that.  The subsequent connections will still
+				 * have a chance to set "dathasloginevt" to false.
 				 */
-				heap_inplace_update(pg_db, tuple);
+				systable_inplace_update_finish(state, tuple);
 			}
+			else
+				systable_inplace_update_cancel(state);
 			table_close(pg_db, RowExclusiveLock);
 			heap_freetuple(tuple);
 		}
