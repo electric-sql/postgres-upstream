@@ -639,6 +639,16 @@ LANGUAGE INTERNAL
 CALLED ON NULL INPUT VOLATILE PARALLEL SAFE
 AS 'pg_stat_reset_slru';
 
+CREATE OR REPLACE FUNCTION
+  pg_set_relation_stats(relation regclass,
+                        relpages integer DEFAULT NULL,
+                        reltuples real DEFAULT NULL,
+                        relallvisible integer DEFAULT NULL)
+RETURNS bool
+LANGUAGE INTERNAL
+CALLED ON NULL INPUT VOLATILE
+AS 'pg_set_relation_stats';
+
 --
 -- The default permissions for functions mean that anyone can execute them.
 -- A number of functions shouldn't be executable by just anyone, but rather
@@ -699,6 +709,8 @@ REVOKE EXECUTE ON FUNCTION pg_ls_logdir() FROM public;
 REVOKE EXECUTE ON FUNCTION pg_ls_waldir() FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_ls_archive_statusdir() FROM public;
+
+REVOKE EXECUTE ON FUNCTION pg_ls_summariesdir() FROM public;
 
 REVOKE EXECUTE ON FUNCTION pg_ls_tmpdir() FROM public;
 
@@ -769,6 +781,8 @@ GRANT EXECUTE ON FUNCTION pg_ls_logdir() TO pg_monitor;
 GRANT EXECUTE ON FUNCTION pg_ls_waldir() TO pg_monitor;
 
 GRANT EXECUTE ON FUNCTION pg_ls_archive_statusdir() TO pg_monitor;
+
+GRANT EXECUTE ON FUNCTION pg_ls_summariesdir() TO pg_monitor;
 
 GRANT EXECUTE ON FUNCTION pg_ls_tmpdir() TO pg_monitor;
 

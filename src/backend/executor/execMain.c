@@ -296,9 +296,6 @@ ExecutorRun(QueryDesc *queryDesc,
 			ScanDirection direction, uint64 count,
 			bool execute_once)
 {
-	/* If enabled, the query ID should be set. */
-	Assert(!IsQueryIdEnabled() || pgstat_get_my_query_id() != 0);
-
 	if (ExecutorRun_hook)
 		(*ExecutorRun_hook) (queryDesc, direction, count, execute_once);
 	else
@@ -407,9 +404,6 @@ standard_ExecutorRun(QueryDesc *queryDesc,
 void
 ExecutorFinish(QueryDesc *queryDesc)
 {
-	/* If enabled, the query ID should be set. */
-	Assert(!IsQueryIdEnabled() || pgstat_get_my_query_id() != 0);
-
 	if (ExecutorFinish_hook)
 		(*ExecutorFinish_hook) (queryDesc);
 	else
@@ -470,9 +464,6 @@ standard_ExecutorFinish(QueryDesc *queryDesc)
 void
 ExecutorEnd(QueryDesc *queryDesc)
 {
-	/* If enabled, the query ID should be set. */
-	Assert(!IsQueryIdEnabled() || pgstat_get_my_query_id() != 0);
-
 	if (ExecutorEnd_hook)
 		(*ExecutorEnd_hook) (queryDesc);
 	else

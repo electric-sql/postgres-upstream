@@ -728,7 +728,7 @@ typedef struct ColumnDef
 	char	   *colname;		/* name of column */
 	TypeName   *typeName;		/* type of column */
 	char	   *compression;	/* compression method for column */
-	int			inhcount;		/* number of times column is inherited */
+	int16		inhcount;		/* number of times column is inherited */
 	bool		is_local;		/* column has local (non-inherited) def'n */
 	bool		is_not_null;	/* NOT NULL constraint specified? */
 	bool		is_from_type;	/* column definition came from table type */
@@ -1438,6 +1438,7 @@ typedef struct SortGroupClause
 	Index		tleSortGroupRef;	/* reference into targetlist */
 	Oid			eqop;			/* the equality operator ('=' op) */
 	Oid			sortop;			/* the ordering operator ('<' op), or 0 */
+	bool		reverse_sort;	/* is sortop a "greater than" operator? */
 	bool		nulls_first;	/* do NULLs come before normal values? */
 	/* can eqop be implemented by hashing? */
 	bool		hashable pg_node_attr(query_jumble_ignore);
@@ -2616,11 +2617,26 @@ typedef enum VariableSetKind
 
 typedef struct VariableSetStmt
 {
+	pg_node_attr(custom_query_jumble)
+
 	NodeTag		type;
 	VariableSetKind kind;
-	char	   *name;			/* variable to be set */
-	List	   *args;			/* List of A_Const nodes */
-	bool		is_local;		/* SET LOCAL? */
+	/* variable to be set */
+	char	   *name;
+	/* List of A_Const nodes */
+	List	   *args;
+
+	/*
+	 * True if arguments should be accounted for in query jumbling.  We use a
+	 * separate flag rather than query_jumble_ignore on "args" as several
+	 * grammar flavors of SET rely on a list of values that are parsed
+	 * directly from the grammar's keywords.
+	 */
+	bool		jumble_args;
+	/* SET LOCAL? */
+	bool		is_local;
+	/* token location, or -1 if unknown */
+	ParseLoc	location pg_node_attr(query_jumble_location);
 } VariableSetStmt;
 
 /* ----------------------
@@ -2739,8 +2755,6 @@ typedef struct Constraint
 	char	   *cooked_expr;	/* CHECK or DEFAULT expression, as
 								 * nodeToString representation */
 	char		generated_when; /* ALWAYS or BY DEFAULT */
-	int			inhcount;		/* initial inheritance count to apply, for
-								 * "raw" NOT NULL constraints */
 	bool		nulls_not_distinct; /* null treatment for UNIQUE constraints */
 	List	   *keys;			/* String nodes naming referenced key
 								 * column(s); for UNIQUE/PK/NOT NULL */

@@ -419,6 +419,23 @@ defGetCopyOnErrorChoice(DefElem *def, ParseState *pstate, bool is_from)
 }
 
 /*
+ * Extract REJECT_LIMIT value from a DefElem.
+ */
+static int64
+defGetCopyRejectLimitOption(DefElem *def)
+{
+	int64		reject_limit = defGetInt64(def);
+
+	if (reject_limit <= 0)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+				 errmsg("REJECT_LIMIT (%lld) must be greater than zero",
+						(long long) reject_limit)));
+
+	return reject_limit;
+}
+
+/*
  * Extract a CopyLogVerbosityChoice value from a DefElem.
  */
 static CopyLogVerbosityChoice
@@ -427,9 +444,11 @@ defGetCopyLogVerbosityChoice(DefElem *def, ParseState *pstate)
 	char	   *sval;
 
 	/*
-	 * Allow "default", or "verbose" values.
+	 * Allow "silent", "default", or "verbose" values.
 	 */
 	sval = defGetString(def);
+	if (pg_strcasecmp(sval, "silent") == 0)
+		return COPY_LOG_VERBOSITY_SILENT;
 	if (pg_strcasecmp(sval, "default") == 0)
 		return COPY_LOG_VERBOSITY_DEFAULT;
 	if (pg_strcasecmp(sval, "verbose") == 0)
@@ -470,6 +489,7 @@ ProcessCopyOptions(ParseState *pstate,
 	bool		header_specified = false;
 	bool		on_error_specified = false;
 	bool		log_verbosity_specified = false;
+	bool		reject_limit_specified = false;
 	ListCell   *option;
 
 	/* Support external use for option sanity checking */
@@ -636,6 +656,13 @@ ProcessCopyOptions(ParseState *pstate,
 			log_verbosity_specified = true;
 			opts_out->log_verbosity = defGetCopyLogVerbosityChoice(defel, pstate);
 		}
+		else if (strcmp(defel->defname, "reject_limit") == 0)
+		{
+			if (reject_limit_specified)
+				errorConflictingDefElem(defel, pstate);
+			reject_limit_specified = true;
+			opts_out->reject_limit = defGetCopyRejectLimitOption(defel);
+		}
 		else
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
@@ -645,7 +672,7 @@ ProcessCopyOptions(ParseState *pstate,
 	}
 
 	/*
-	 * Check for incompatible options (must do these two before inserting
+	 * Check for incompatible options (must do these three before inserting
 	 * defaults)
 	 */
 	if (opts_out->binary && opts_out->delim)
@@ -663,11 +690,6 @@ ProcessCopyOptions(ParseState *pstate,
 		ereport(ERROR,
 				(errcode(ERRCODE_SYNTAX_ERROR),
 				 errmsg("cannot specify %s in BINARY mode", "DEFAULT")));
-
-	if (opts_out->binary && opts_out->on_error != COPY_ON_ERROR_STOP)
-		ereport(ERROR,
-				(errcode(ERRCODE_SYNTAX_ERROR),
-				 errmsg("only ON_ERROR STOP is allowed in BINARY mode")));
 
 	/* Set defaults for omitted options */
 	if (!opts_out->delim)
@@ -783,12 +805,14 @@ ProcessCopyOptions(ParseState *pstate,
 						"COPY FROM")));
 
 	/* Check force_notnull */
-	if (!opts_out->csv_mode && opts_out->force_notnull != NIL)
+	if (!opts_out->csv_mode && (opts_out->force_notnull != NIL ||
+								opts_out->force_notnull_all))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		/*- translator: %s is the name of a COPY option, e.g. ON_ERROR */
 				 errmsg("COPY %s requires CSV mode", "FORCE_NOT_NULL")));
-	if (opts_out->force_notnull != NIL && !is_from)
+	if ((opts_out->force_notnull != NIL || opts_out->force_notnull_all) &&
+		!is_from)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 		/*- translator: first %s is the name of a COPY option, e.g. ON_ERROR,
@@ -797,13 +821,15 @@ ProcessCopyOptions(ParseState *pstate,
 						"COPY TO")));
 
 	/* Check force_null */
-	if (!opts_out->csv_mode && opts_out->force_null != NIL)
+	if (!opts_out->csv_mode && (opts_out->force_null != NIL ||
+								opts_out->force_null_all))
 		ereport(ERROR,
 				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 		/*- translator: %s is the name of a COPY option, e.g. ON_ERROR */
 				 errmsg("COPY %s requires CSV mode", "FORCE_NULL")));
 
-	if (opts_out->force_null != NIL && !is_from)
+	if ((opts_out->force_null != NIL || opts_out->force_null_all) &&
+		!is_from)
 		ereport(ERROR,
 				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 		/*- translator: first %s is the name of a COPY option, e.g. ON_ERROR,
@@ -872,6 +898,19 @@ ProcessCopyOptions(ParseState *pstate,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("NULL specification and DEFAULT specification cannot be the same")));
 	}
+	/* Check on_error */
+	if (opts_out->binary && opts_out->on_error != COPY_ON_ERROR_STOP)
+		ereport(ERROR,
+				(errcode(ERRCODE_SYNTAX_ERROR),
+				 errmsg("only ON_ERROR STOP is allowed in BINARY mode")));
+
+	if (opts_out->reject_limit && !opts_out->on_error)
+		ereport(ERROR,
+				(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+		/*- translator: first and second %s are the names of COPY option, e.g.
+		 * ON_ERROR, third is the value of the COPY option, e.g. IGNORE */
+				 errmsg("COPY %s requires %s to be set to %s",
+						"REJECT_LIMIT", "ON_ERROR", "IGNORE")));
 }
 
 /*

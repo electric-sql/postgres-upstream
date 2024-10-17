@@ -207,9 +207,11 @@ member_verify_header(astreamer *streamer, astreamer_member *member)
 	if (m->size != member->size)
 	{
 		report_backup_error(mystreamer->context,
-							"\"%s\" has size %lld in \"%s\" but size %zu in the manifest",
-							member->pathname, (long long int) member->size,
-							mystreamer->archive_name, m->size);
+							"\"%s\" has size %llu in \"%s\" but size %llu in the manifest",
+							member->pathname,
+							(unsigned long long) member->size,
+							mystreamer->archive_name,
+							(unsigned long long) m->size);
 		m->bad = true;
 		return;
 	}
@@ -294,9 +296,10 @@ member_verify_checksum(astreamer *streamer)
 	if (mystreamer->checksum_bytes != m->size)
 	{
 		report_backup_error(mystreamer->context,
-							"file \"%s\" in \"%s\" should contain %zu bytes, but read %zu bytes",
+							"file \"%s\" in \"%s\" should contain %llu bytes, but read %llu bytes",
 							m->pathname, mystreamer->archive_name,
-							m->size, mystreamer->checksum_bytes);
+							(unsigned long long) m->size,
+							(unsigned long long) mystreamer->checksum_bytes);
 		return;
 	}
 
@@ -341,14 +344,14 @@ member_copy_control_data(astreamer *streamer, astreamer_member *member,
 	 * be PG_CONTROL_FILE_SIZE, but the part that fits in our buffer is
 	 * shorter, just sizeof(ControlFileData).
 	 */
-	if (mystreamer->control_file_bytes <= sizeof(ControlFileData))
+	if (mystreamer->control_file_bytes < sizeof(ControlFileData))
 	{
-		int			remaining;
+		size_t		remaining;
 
 		remaining = sizeof(ControlFileData) - mystreamer->control_file_bytes;
 		memcpy(((char *) &mystreamer->control_file)
 			   + mystreamer->control_file_bytes,
-			   data, Min(len, remaining));
+			   data, Min((size_t) len, remaining));
 	}
 
 	/* Remember how many bytes we saw, even if we didn't buffer them. */

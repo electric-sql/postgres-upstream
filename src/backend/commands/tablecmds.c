@@ -66,6 +66,7 @@
 #include "commands/typecmds.h"
 #include "commands/user.h"
 #include "commands/vacuum.h"
+#include "common/int.h"
 #include "executor/executor.h"
 #include "foreign/fdwapi.h"
 #include "foreign/foreign.h"
@@ -447,7 +448,6 @@ static bool check_for_column_name_collision(Relation rel, const char *colname,
 											bool if_not_exists);
 static void add_column_datatype_dependency(Oid relid, int32 attnum, Oid typid);
 static void add_column_collation_dependency(Oid relid, int32 attnum, Oid collid);
-static void ATPrepDropNotNull(Relation rel, bool recurse, bool recursing);
 static ObjectAddress ATExecDropNotNull(Relation rel, const char *colName, LOCKMODE lockmode);
 static void ATPrepSetNotNull(List **wqueue, Relation rel,
 							 AlterTableCmd *cmd, bool recurse, bool recursing,
@@ -734,6 +734,12 @@ DefineRelation(CreateStmt *stmt, char relkind, Oid ownerId,
 	}
 	else
 		partitioned = false;
+
+	if (relkind == RELKIND_PARTITIONED_TABLE &&
+		stmt->relation->relpersistence == RELPERSISTENCE_UNLOGGED)
+		ereport(ERROR,
+				(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
+				 errmsg("partitioned tables cannot be unlogged")));
 
 	/*
 	 * Look up the namespace in which we are supposed to create the relation,
@@ -3039,8 +3045,8 @@ MergeCheckConstraint(List *constraints, const char *name, Node *expr)
 		if (equal(expr, ccon->expr))
 		{
 			/* OK to merge constraint with existing */
-			ccon->inhcount++;
-			if (ccon->inhcount < 0)
+			if (pg_add_s16_overflow(ccon->inhcount, 1,
+									&ccon->inhcount))
 				ereport(ERROR,
 						errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("too many inheritance parents"));
@@ -3342,8 +3348,8 @@ MergeInheritedAttribute(List *inh_columns,
 	 * Default and other constraints are handled by the caller.
 	 */
 
-	prevdef->inhcount++;
-	if (prevdef->inhcount < 0)
+	if (pg_add_s16_overflow(prevdef->inhcount, 1,
+							&prevdef->inhcount))
 		ereport(ERROR,
 				errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 				errmsg("too many inheritance parents"));
@@ -4132,9 +4138,9 @@ RenameRelationInternal(Oid myrelid, const char *newrelname, bool is_internal, bo
 	relrelation = table_open(RelationRelationId, RowExclusiveLock);
 
 	reltup = SearchSysCacheLockedCopy1(RELOID, ObjectIdGetDatum(myrelid));
-	otid = reltup->t_self;
 	if (!HeapTupleIsValid(reltup))	/* shouldn't happen */
 		elog(ERROR, "cache lookup failed for relation %u", myrelid);
+	otid = reltup->t_self;
 	relform = (Form_pg_class) GETSTRUCT(reltup);
 
 	if (get_relname_relid(newrelname, namespaceId) != InvalidOid)
@@ -4858,7 +4864,6 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 		case AT_DropNotNull:	/* ALTER COLUMN DROP NOT NULL */
 			ATSimplePermissions(cmd->subtype, rel,
 								ATT_TABLE | ATT_PARTITIONED_TABLE | ATT_FOREIGN_TABLE);
-			ATPrepDropNotNull(rel, recurse, recursing);
 			ATSimpleRecursion(wqueue, rel, cmd, recurse, lockmode, context);
 			pass = AT_PASS_DROP;
 			break;
@@ -4995,8 +5000,7 @@ ATPrepCmd(List **wqueue, Relation rel, AlterTableCmd *cmd,
 			break;
 		case AT_SetLogged:		/* SET LOGGED */
 		case AT_SetUnLogged:	/* SET UNLOGGED */
-			ATSimplePermissions(cmd->subtype, rel,
-								ATT_TABLE | ATT_PARTITIONED_TABLE | ATT_SEQUENCE);
+			ATSimplePermissions(cmd->subtype, rel, ATT_TABLE | ATT_SEQUENCE);
 			if (tab->chgPersistence)
 				ereport(ERROR,
 						(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
@@ -7086,8 +7090,8 @@ ATExecAddColumn(List **wqueue, AlteredTableInfo *tab, Relation rel,
 								   get_collation_name(childatt->attcollation))));
 
 			/* Bump the existing child att's inhcount */
-			childatt->attinhcount++;
-			if (childatt->attinhcount < 0)
+			if (pg_add_s16_overflow(childatt->attinhcount, 1,
+									&childatt->attinhcount))
 				ereport(ERROR,
 						errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("too many inheritance parents"));
@@ -7498,29 +7502,7 @@ add_column_collation_dependency(Oid relid, int32 attnum, Oid collid)
 
 /*
  * ALTER TABLE ALTER COLUMN DROP NOT NULL
- */
-
-static void
-ATPrepDropNotNull(Relation rel, bool recurse, bool recursing)
-{
-	/*
-	 * If the parent is a partitioned table, like check constraints, we do not
-	 * support removing the NOT NULL while partitions exist.
-	 */
-	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE)
-	{
-		PartitionDesc partdesc = RelationGetPartitionDesc(rel, true);
-
-		Assert(partdesc != NULL);
-		if (partdesc->nparts > 0 && !recurse && !recursing)
-			ereport(ERROR,
-					(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-					 errmsg("cannot remove constraint from only the partitioned table when partitions exist"),
-					 errhint("Do not specify the ONLY keyword.")));
-	}
-}
-
-/*
+ *
  * Return the address of the modified column.  If the column was already
  * nullable, InvalidObjectAddress is returned.
  */
@@ -10189,7 +10171,7 @@ addFkRecurseReferenced(List **wqueue, Constraint *fkconstraint, Relation rel,
 	Oid			constrOid;
 	char	   *conname;
 	bool		conislocal;
-	int			coninhcount;
+	int16		coninhcount;
 	bool		connoinherit;
 	Oid			deleteTriggerOid,
 				updateTriggerOid;
@@ -10568,9 +10550,9 @@ addFkRecurseReferencing(List **wqueue, Constraint *fkconstraint, Relation rel,
 									  NULL,
 									  NULL,
 									  NULL,
-									  false,
-									  1,
-									  false,
+									  false,	/* conIsLocal */
+									  1,	/* conInhCount */
+									  false,	/* conNoInherit */
 									  with_period,	/* conPeriod */
 									  false);
 
@@ -11095,8 +11077,8 @@ CloneFkReferencing(List **wqueue, Relation parentRel, Relation partRel)
 								  NULL,
 								  NULL,
 								  NULL,
-								  false,	/* islocal */
-								  1,	/* inhcount */
+								  false,	/* conIsLocal */
+								  1,	/* conInhCount */
 								  false,	/* conNoInherit */
 								  with_period,	/* conPeriod */
 								  true);
@@ -12712,18 +12694,6 @@ ATExecDropConstraint(Relation rel, const char *constrName,
 		children = find_inheritance_children(RelationGetRelid(rel), lockmode);
 	else
 		children = NIL;
-
-	/*
-	 * For a partitioned table, if partitions exist and we are told not to
-	 * recurse, it's a user error.  It doesn't make sense to have a constraint
-	 * be defined only on the parent, especially if it's a partitioned table.
-	 */
-	if (rel->rd_rel->relkind == RELKIND_PARTITIONED_TABLE &&
-		children != NIL && !recurse)
-		ereport(ERROR,
-				(errcode(ERRCODE_INVALID_TABLE_DEFINITION),
-				 errmsg("cannot remove constraint from only the partitioned table when partitions exist"),
-				 errhint("Do not specify the ONLY keyword.")));
 
 	foreach_oid(childrelid, children)
 	{
@@ -15975,8 +15945,8 @@ MergeAttributesIntoExisting(Relation child_rel, Relation parent_rel, bool ispart
 			 * OK, bump the child column's inheritance count.  (If we fail
 			 * later on, this change will just roll back.)
 			 */
-			child_att->attinhcount++;
-			if (child_att->attinhcount < 0)
+			if (pg_add_s16_overflow(child_att->attinhcount, 1,
+									&child_att->attinhcount))
 				ereport(ERROR,
 						errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("too many inheritance parents"));
@@ -16106,8 +16076,9 @@ MergeConstraintsIntoExisting(Relation child_rel, Relation parent_rel)
 			 */
 			child_copy = heap_copytuple(child_tuple);
 			child_con = (Form_pg_constraint) GETSTRUCT(child_copy);
-			child_con->coninhcount++;
-			if (child_con->coninhcount < 0)
+
+			if (pg_add_s16_overflow(child_con->coninhcount, 1,
+									&child_con->coninhcount))
 				ereport(ERROR,
 						errcode(ERRCODE_PROGRAM_LIMIT_EXCEEDED),
 						errmsg("too many inheritance parents"));
@@ -18719,8 +18690,14 @@ ATExecAttachPartition(List **wqueue, Relation rel, PartitionCmd *cmd,
 	 * constraint as well.
 	 */
 	partBoundConstraint = get_qual_from_partbound(rel, cmd->bound);
-	partConstraint = list_concat(partBoundConstraint,
-								 RelationGetPartitionQual(rel));
+
+	/*
+	 * Use list_concat_copy() to avoid modifying partBoundConstraint in place,
+	 * since it's needed later to construct the constraint expression for
+	 * validating against the default partition, if any.
+	 */
+	partConstraint = list_concat_copy(partBoundConstraint,
+									  RelationGetPartitionQual(rel));
 
 	/* Skip validation if there are no constraints to validate. */
 	if (partConstraint)

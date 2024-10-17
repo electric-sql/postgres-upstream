@@ -21437,7 +21437,7 @@ SELECT NULLIF(value, '(none)') ...
        </para>
        <para>
         Extracts the lower bound of the multirange (<literal>NULL</literal> if the
-        multirange is empty has no lower bound).
+        multirange is empty or has no lower bound).
        </para>
        <para>
         <literal>lower('{[1.1,2.2)}'::nummultirange)</literal>
@@ -22125,7 +22125,7 @@ SELECT NULLIF(value, '(none)') ...
        <para>
         Computes the maximum of the non-null input
         values.  Available for any numeric, string, date/time, or enum type,
-        as well as <type>inet</type>, <type>interval</type>,
+        as well as <type>bytea</type>, <type>inet</type>, <type>interval</type>,
         <type>money</type>, <type>oid</type>, <type>pg_lsn</type>,
         <type>tid</type>, <type>xid8</type>,
         and also arrays and composite types containing sortable data types.
@@ -22144,7 +22144,7 @@ SELECT NULLIF(value, '(none)') ...
        <para>
         Computes the minimum of the non-null input
         values.  Available for any numeric, string, date/time, or enum type,
-        as well as <type>inet</type>, <type>interval</type>,
+        as well as <type>bytea</type>, <type>inet</type>, <type>interval</type>,
         <type>money</type>, <type>oid</type>, <type>pg_lsn</type>,
         <type>tid</type>, <type>xid8</type>,
         and also arrays and composite types containing sortable data types.
@@ -30136,6 +30136,100 @@ DETAIL:  Make sure pg_wal_replay_wait() isn't called within a transaction with a
    </table>
 
    <para>
+    <xref linkend="functions-admin-statsmod"/> lists functions used to
+    manipulate statistics.
+    <warning>
+     <para>
+      Changes made by these statistics manipulation functions are likely to be
+      overwritten by <link linkend="autovacuum">autovacuum</link> (or manual
+      <command>VACUUM</command> or <command>ANALYZE</command>) and should be
+      considered temporary.
+     </para>
+    </warning>
+   </para>
+
+   <table id="functions-admin-statsmod">
+    <title>Database Object Statistics Manipulation Functions</title>
+    <tgroup cols="1">
+     <thead>
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        Function
+       </para>
+       <para>
+        Description
+       </para></entry>
+      </row>
+     </thead>
+
+     <tbody>
+      <row>
+       <entry role="func_table_entry">
+        <para role="func_signature">
+         <indexterm>
+          <primary>pg_set_relation_stats</primary>
+         </indexterm>
+         <function>pg_set_relation_stats</function> (
+         <parameter>relation</parameter> <type>regclass</type>
+         <optional>, <parameter>relpages</parameter> <type>integer</type></optional>
+         <optional>, <parameter>reltuples</parameter> <type>real</type></optional>
+         <optional>, <parameter>relallvisible</parameter> <type>integer</type></optional> )
+         <returnvalue>boolean</returnvalue>
+        </para>
+        <para>
+         Updates relation-level statistics for the given relation to the
+         specified values. The parameters correspond to columns in <link
+         linkend="catalog-pg-class"><structname>pg_class</structname></link>. Unspecified
+         or <literal>NULL</literal> values leave the setting
+         unchanged. Returns <literal>true</literal> if a change was made;
+         <literal>false</literal> otherwise.
+        </para>
+        <para>
+         Ordinarily, these statistics are collected automatically or updated
+         as a part of <xref linkend="sql-vacuum"/> or <xref
+         linkend="sql-analyze"/>, so it's not necessary to call this
+         function. However, it may be useful when testing the effects of
+         statistics on the planner to understand or anticipate plan changes.
+        </para>
+        <para>
+         The caller must have the <literal>MAINTAIN</literal> privilege on
+         the table or be the owner of the database.
+        </para>
+        <para>
+         The value of <structfield>relpages</structfield> must be greater than
+         or equal to <literal>0</literal>,
+         <structfield>reltuples</structfield> must be greater than or equal to
+         <literal>-1.0</literal>, and <structfield>relallvisible</structfield>
+         must be greater than or equal to <literal>0</literal>.
+        </para>
+       </entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry">
+        <para role="func_signature">
+         <indexterm>
+          <primary>pg_clear_relation_stats</primary>
+         </indexterm>
+         <function>pg_clear_relation_stats</function> ( <parameter>relation</parameter> <type>regclass</type> )
+         <returnvalue>boolean</returnvalue>
+        </para>
+        <para>
+         Clears table-level statistics for the given relation, as though the
+         table was newly created. Returns <literal>true</literal> if a change
+         was made; <literal>false</literal> otherwise.
+        </para>
+        <para>
+         The caller must have the <literal>MAINTAIN</literal> privilege on
+         the table or be the owner of the database.
+        </para>
+       </entry>
+      </row>
+     </tbody>
+    </tgroup>
+   </table>
+
+   <para>
     <xref linkend="functions-info-partition"/> lists functions that provide
     information about the structure of partitioned tables.
    </para>
@@ -30521,6 +30615,30 @@ SELECT pg_size_pretty(sum(pg_relation_size(relid))) AS total_size
         ordinary file in the server's <filename>pg_replslot/slot_name</filename>
         directory, where <parameter>slot_name</parameter> is the name of the
         replication slot provided as input of the function. Filenames beginning
+        with a dot, directories, and other special files are excluded.
+       </para>
+       <para>
+        This function is restricted to superusers and members of
+        the <literal>pg_monitor</literal> role by default, but other users can
+        be granted EXECUTE to run the function.
+       </para></entry>
+      </row>
+
+      <row>
+       <entry role="func_table_entry"><para role="func_signature">
+        <indexterm>
+         <primary>pg_ls_summariesdir</primary>
+        </indexterm>
+        <function>pg_ls_summariesdir</function> ()
+        <returnvalue>setof record</returnvalue>
+        ( <parameter>name</parameter> <type>text</type>,
+        <parameter>size</parameter> <type>bigint</type>,
+        <parameter>modification</parameter> <type>timestamp with time zone</type> )
+       </para>
+       <para>
+        Returns the name, size, and last modification time (mtime) of each
+        ordinary file in the server's WAL summaries directory
+        (<filename>pg_wal/summaries</filename>).  Filenames beginning
         with a dot, directories, and other special files are excluded.
        </para>
        <para>

@@ -1003,6 +1003,7 @@ GenerationBlock
 GenerationContext
 GenerationPointer
 GenericCosts
+GenericXLogPageData
 GenericXLogState
 GeqoPrivateData
 GetForeignJoinPaths_function
@@ -1975,7 +1976,6 @@ PX_Combo
 PX_HMAC
 PX_MD
 Page
-PageData
 PageGistNSN
 PageHeader
 PageHeaderData
@@ -2810,6 +2810,7 @@ TBMSharedIterator
 TBMSharedIteratorState
 TBMStatus
 TBlockState
+TCPattern
 TIDBitmap
 TM_FailureData
 TM_IndexDelete
@@ -3601,6 +3602,7 @@ libpq_source
 line_t
 lineno_t
 list_sort_comparator
+loc_chunk
 local_relopt
 local_relopts
 local_source
