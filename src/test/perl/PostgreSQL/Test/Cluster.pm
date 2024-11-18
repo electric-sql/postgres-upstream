@@ -1194,6 +1194,9 @@ this to fail.  Otherwise, tests might fail to detect server crashes.
 With optional extra param fail_ok => 1, returns 0 for failure
 instead of bailing out.
 
+The optional extra param timeout can be used to pass the pg_ctl
+--timeout option.
+
 =cut
 
 sub stop
@@ -1209,8 +1212,11 @@ sub stop
 	return 1 unless defined $self->{_pid};
 
 	print "### Stopping node \"$name\" using mode $mode\n";
-	$ret = PostgreSQL::Test::Utils::system_log('pg_ctl', '-D', $pgdata,
-		'-m', $mode, 'stop');
+	my @cmd = ('pg_ctl', '-D', $pgdata, '-m', $mode, 'stop');
+	if ($params{timeout}) {
+		push(@cmd, ('--timeout', $params{timeout}));
+	}
+	$ret = PostgreSQL::Test::Utils::system_log(@cmd);
 
 	if ($ret != 0)
 	{
@@ -2286,6 +2292,12 @@ connection.
 
 If given, it must be an array reference containing additional parameters to B<psql>.
 
+=item wait => 1
+
+By default, this method will not return until connection has completed (or
+failed). Set B<wait> to 0 to return immediately instead. (Clients can call the
+session's C<wait_connect> method manually when needed.)
+
 =back
 
 =cut
@@ -2316,13 +2328,15 @@ sub background_psql
 		'-XAtq', '-d', $psql_connstr, '-f', '-');
 
 	$params{on_error_stop} = 1 unless defined $params{on_error_stop};
+	$params{wait} = 1 unless defined $params{wait};
 	$timeout = $params{timeout} if defined $params{timeout};
 
 	push @psql_params, '-v', 'ON_ERROR_STOP=1' if $params{on_error_stop};
 	push @psql_params, @{ $params{extra_params} }
 	  if defined $params{extra_params};
 
-	return PostgreSQL::Test::BackgroundPsql->new(0, \@psql_params, $timeout);
+	return PostgreSQL::Test::BackgroundPsql->new(0, \@psql_params, $timeout,
+		$params{wait});
 }
 
 =pod
@@ -2961,7 +2975,7 @@ sub check_extension
 
 =pod
 
-=item $node->wait_for_event(wait_event_name, backend_type)
+=item $node->wait_for_event(backend_type, wait_event_name)
 
 Poll pg_stat_activity until backend_type reaches wait_event_name.
 

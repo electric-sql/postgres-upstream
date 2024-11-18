@@ -19,11 +19,9 @@
 
 #include "access/detoast.h"
 #include "access/htup_details.h"
-#include "access/transam.h"
 #include "access/tupconvert.h"
 #include "catalog/pg_proc.h"
 #include "catalog/pg_type.h"
-#include "commands/defrem.h"
 #include "executor/execExpr.h"
 #include "executor/spi.h"
 #include "executor/tstoreReceiver.h"
@@ -34,13 +32,10 @@
 #include "optimizer/optimizer.h"
 #include "parser/parse_coerce.h"
 #include "parser/parse_type.h"
-#include "parser/scansup.h"
 #include "plpgsql.h"
 #include "storage/proc.h"
 #include "tcop/cmdtag.h"
 #include "tcop/pquery.h"
-#include "tcop/tcopprot.h"
-#include "tcop/utility.h"
 #include "utils/array.h"
 #include "utils/builtins.h"
 #include "utils/datum.h"
@@ -532,21 +527,22 @@ plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
 									  false);
 
 					/*
-					 * Force any array-valued parameter to be stored in
+					 * If it's a varlena type, check to see if we received a
+					 * R/W expanded-object pointer.  If so, we can commandeer
+					 * the object rather than having to copy it.  If passed a
+					 * R/O expanded pointer, just keep it as the value of the
+					 * variable for the moment.  (We can change it to R/W if
+					 * the variable gets modified, but that may very well
+					 * never happen.)
+					 *
+					 * Also, force any flat array value to be stored in
 					 * expanded form in our local variable, in hopes of
 					 * improving efficiency of uses of the variable.  (This is
 					 * a hack, really: why only arrays? Need more thought
 					 * about which cases are likely to win.  See also
 					 * typisarray-specific heuristic in exec_assign_value.)
-					 *
-					 * Special cases: If passed a R/W expanded pointer, assume
-					 * we can commandeer the object rather than having to copy
-					 * it.  If passed a R/O expanded pointer, just keep it as
-					 * the value of the variable for the moment.  (We'll force
-					 * it to R/W if the variable gets modified, but that may
-					 * very well never happen.)
 					 */
-					if (!var->isnull && var->datatype->typisarray)
+					if (!var->isnull && var->datatype->typlen == -1)
 					{
 						if (VARATT_IS_EXTERNAL_EXPANDED_RW(DatumGetPointer(var->value)))
 						{
@@ -561,7 +557,7 @@ plpgsql_exec_function(PLpgSQL_function *func, FunctionCallInfo fcinfo,
 						{
 							/* R/O pointer, keep it as-is until assigned to */
 						}
-						else
+						else if (var->datatype->typisarray)
 						{
 							/* flat array, so force to expanded form */
 							assign_simple_var(&estate, var,

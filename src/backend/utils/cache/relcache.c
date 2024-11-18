@@ -276,7 +276,8 @@ static HTAB *OpClassCache = NULL;
 static void RelationCloseCleanup(Relation relation);
 static void RelationDestroyRelation(Relation relation, bool remember_tupdesc);
 static void RelationInvalidateRelation(Relation relation);
-static void RelationClearRelation(Relation relation, bool rebuild);
+static void RelationClearRelation(Relation relation);
+static void RelationRebuildRelation(Relation relation);
 
 static void RelationReloadIndexInfo(Relation relation);
 static void RelationReloadNailed(Relation relation);
@@ -721,7 +722,7 @@ RelationBuildTupleDesc(Relation relation)
  * we make a private memory context to hold the RuleLock information for
  * each relcache entry that has associated rules.  The context is used
  * just for rule info, not for any other subsidiary data of the relcache
- * entry, because that keeps the update logic in RelationClearRelation()
+ * entry, because that keeps the update logic in RelationRebuildRelation()
  * manageable.  The other subsidiary data structures are simple enough
  * to be easy to free explicitly, anyway.
  *
@@ -2083,16 +2084,7 @@ RelationIdGetRelation(Oid relationId)
 		/* revalidate cache entry if necessary */
 		if (!rd->rd_isvalid)
 		{
-			/*
-			 * Indexes only have a limited number of possible schema changes,
-			 * and we don't want to use the full-blown procedure because it's
-			 * a headache for indexes that reload itself depends on.
-			 */
-			if (rd->rd_rel->relkind == RELKIND_INDEX ||
-				rd->rd_rel->relkind == RELKIND_PARTITIONED_INDEX)
-				RelationReloadIndexInfo(rd);
-			else
-				RelationClearRelation(rd, true);
+			RelationRebuildRelation(rd);
 
 			/*
 			 * Normally entries need to be valid here, but before the relcache
@@ -2220,7 +2212,7 @@ RelationCloseCleanup(Relation relation)
 	if (RelationHasReferenceCountZero(relation) &&
 		relation->rd_createSubid == InvalidSubTransactionId &&
 		relation->rd_firstRelfilelocatorSubid == InvalidSubTransactionId)
-		RelationClearRelation(relation, false);
+		RelationClearRelation(relation);
 #endif
 }
 
@@ -2235,15 +2227,8 @@ RelationCloseCleanup(Relation relation)
  *	and/or in active use.  We support full replacement of the pg_class row,
  *	as well as updates of a few simple fields of the pg_index row.
  *
- *	We can't necessarily reread the catalog rows right away; we might be
- *	in a failed transaction when we receive the SI notification.  If so,
- *	RelationClearRelation just marks the entry as invalid by setting
- *	rd_isvalid to false.  This routine is called to fix the entry when it
- *	is next needed.
- *
  *	We assume that at the time we are called, we have at least AccessShareLock
- *	on the target index.  (Note: in the calls from RelationClearRelation,
- *	this is legitimate because we know the rel has positive refcount.)
+ *	on the target index.
  *
  *	If the target index is an index on pg_class or pg_index, we'd better have
  *	previously gotten at least AccessShareLock on its underlying catalog,
@@ -2264,23 +2249,18 @@ RelationReloadIndexInfo(Relation relation)
 		   !relation->rd_isvalid &&
 		   relation->rd_droppedSubid == InvalidSubTransactionId);
 
-	/* Ensure it's closed at smgr level */
-	RelationCloseSmgr(relation);
-
-	/* Must free any AM cached data upon relcache flush */
-	if (relation->rd_amcache)
-		pfree(relation->rd_amcache);
-	relation->rd_amcache = NULL;
-
 	/*
 	 * If it's a shared index, we might be called before backend startup has
 	 * finished selecting a database, in which case we have no way to read
 	 * pg_class yet.  However, a shared index can never have any significant
-	 * schema updates, so it's okay to ignore the invalidation signal.  Just
-	 * mark it valid and return without doing anything more.
+	 * schema updates, so it's okay to mostly ignore the invalidation signal.
+	 * Its physical relfilenumber might've changed, but that's all.  Update
+	 * the physical relfilenumber, mark it valid and return without doing
+	 * anything more.
 	 */
 	if (relation->rd_rel->relisshared && !criticalRelcachesBuilt)
 	{
+		RelationInitPhysicalAddr(relation);
 		relation->rd_isvalid = true;
 		return;
 	}
@@ -2368,7 +2348,13 @@ RelationReloadIndexInfo(Relation relation)
 static void
 RelationReloadNailed(Relation relation)
 {
+	/* Should be called only for invalidated, nailed relations */
+	Assert(!relation->rd_isvalid);
 	Assert(relation->rd_isnailed);
+	/* nailed indexes are handled by RelationReloadIndexInfo() */
+	Assert(relation->rd_rel->relkind == RELKIND_RELATION);
+	/* can only reread catalog contents in a transaction */
+	Assert(IsTransactionState());
 
 	/*
 	 * Redo RelationInitPhysicalAddr in case it is a mapped relation whose
@@ -2376,58 +2362,35 @@ RelationReloadNailed(Relation relation)
 	 */
 	RelationInitPhysicalAddr(relation);
 
-	/* flag as needing to be revalidated */
-	relation->rd_isvalid = false;
-
 	/*
-	 * Can only reread catalog contents if in a transaction.  If the relation
-	 * is currently open (not counting the nailed refcount), do so
-	 * immediately. Otherwise we've already marked the entry as possibly
-	 * invalid, and it'll be fixed when next opened.
+	 * Reload a non-index entry.  We can't easily do so if relcaches aren't
+	 * yet built, but that's fine because at that stage the attributes that
+	 * need to be current (like relfrozenxid) aren't yet accessed.  To ensure
+	 * the entry will later be revalidated, we leave it in invalid state, but
+	 * allow use (cf. RelationIdGetRelation()).
 	 */
-	if (!IsTransactionState() || relation->rd_refcnt <= 1)
-		return;
-
-	if (relation->rd_rel->relkind == RELKIND_INDEX)
+	if (criticalRelcachesBuilt)
 	{
+		HeapTuple	pg_class_tuple;
+		Form_pg_class relp;
+
 		/*
-		 * If it's a nailed-but-not-mapped index, then we need to re-read the
-		 * pg_class row to see if its relfilenumber changed.
+		 * NB: Mark the entry as valid before starting to scan, to avoid
+		 * self-recursion when re-building pg_class.
 		 */
-		RelationReloadIndexInfo(relation);
-	}
-	else
-	{
+		relation->rd_isvalid = true;
+
+		pg_class_tuple = ScanPgRelation(RelationGetRelid(relation),
+										true, false);
+		relp = (Form_pg_class) GETSTRUCT(pg_class_tuple);
+		memcpy(relation->rd_rel, relp, CLASS_TUPLE_SIZE);
+		heap_freetuple(pg_class_tuple);
+
 		/*
-		 * Reload a non-index entry.  We can't easily do so if relcaches
-		 * aren't yet built, but that's fine because at that stage the
-		 * attributes that need to be current (like relfrozenxid) aren't yet
-		 * accessed.  To ensure the entry will later be revalidated, we leave
-		 * it in invalid state, but allow use (cf. RelationIdGetRelation()).
+		 * Again mark as valid, to protect against concurrently arriving
+		 * invalidations.
 		 */
-		if (criticalRelcachesBuilt)
-		{
-			HeapTuple	pg_class_tuple;
-			Form_pg_class relp;
-
-			/*
-			 * NB: Mark the entry as valid before starting to scan, to avoid
-			 * self-recursion when re-building pg_class.
-			 */
-			relation->rd_isvalid = true;
-
-			pg_class_tuple = ScanPgRelation(RelationGetRelid(relation),
-											true, false);
-			relp = (Form_pg_class) GETSTRUCT(pg_class_tuple);
-			memcpy(relation->rd_rel, relp, CLASS_TUPLE_SIZE);
-			heap_freetuple(pg_class_tuple);
-
-			/*
-			 * Again mark as valid, to protect against concurrently arriving
-			 * invalidations.
-			 */
-			relation->rd_isvalid = true;
-		}
+		relation->rd_isvalid = true;
 	}
 }
 
@@ -2537,120 +2500,86 @@ RelationInvalidateRelation(Relation relation)
 }
 
 /*
- * RelationClearRelation
+ * RelationClearRelation - physically blow away a relation cache entry
  *
- *	 Physically blow away a relation cache entry, or reset it and rebuild
- *	 it from scratch (that is, from catalog entries).  The latter path is
- *	 used when we are notified of a change to an open relation (one with
- *	 refcount > 0).
- *
- *	 NB: when rebuilding, we'd better hold some lock on the relation,
- *	 else the catalog data we need to read could be changing under us.
- *	 Also, a rel to be rebuilt had better have refcnt > 0.  This is because
- *	 a sinval reset could happen while we're accessing the catalogs, and
- *	 the rel would get blown away underneath us by RelationCacheInvalidate
- *	 if it has zero refcnt.
- *
- *	 The "rebuild" parameter is redundant in current usage because it has
- *	 to match the relation's refcnt status, but we keep it as a crosscheck
- *	 that we're doing what the caller expects.
+ * The caller must ensure that the entry is no longer needed, i.e. its
+ * reference count is zero.  Also, the rel or its storage must not be created
+ * in the current transaction (rd_createSubid and rd_firstRelfilelocatorSubid
+ * must not be set).
  */
 static void
-RelationClearRelation(Relation relation, bool rebuild)
+RelationClearRelation(Relation relation)
 {
+	Assert(RelationHasReferenceCountZero(relation));
+	Assert(!relation->rd_isnailed);
+
 	/*
-	 * As per notes above, a rel to be rebuilt MUST have refcnt > 0; while of
-	 * course it would be an equally bad idea to blow away one with nonzero
-	 * refcnt, since that would leave someone somewhere with a dangling
-	 * pointer.  All callers are expected to have verified that this holds.
+	 * Relations created in the same transaction must never be removed, see
+	 * RelationFlushRelation.
 	 */
-	Assert(rebuild ?
-		   !RelationHasReferenceCountZero(relation) :
-		   RelationHasReferenceCountZero(relation));
+	Assert(relation->rd_createSubid == InvalidSubTransactionId);
+	Assert(relation->rd_firstRelfilelocatorSubid == InvalidSubTransactionId);
+	Assert(relation->rd_droppedSubid == InvalidSubTransactionId);
+
+	/* first mark it as invalid */
+	RelationInvalidateRelation(relation);
+
+	/* Remove it from the hash table */
+	RelationCacheDelete(relation);
+
+	/* And release storage */
+	RelationDestroyRelation(relation, false);
+}
+
+/*
+ * RelationRebuildRelation - rebuild a relation cache entry in place
+ *
+ * Reset and rebuild a relation cache entry from scratch (that is, from
+ * catalog entries).  This is used when we are notified of a change to an open
+ * relation (one with refcount > 0).  The entry is reconstructed without
+ * moving the physical RelationData record, so that the refcount holder's
+ * pointer is still valid.
+ *
+ * NB: when rebuilding, we'd better hold some lock on the relation, else the
+ * catalog data we need to read could be changing under us.  Also, a rel to be
+ * rebuilt had better have refcnt > 0.  This is because a sinval reset could
+ * happen while we're accessing the catalogs, and the rel would get blown away
+ * underneath us by RelationCacheInvalidate if it has zero refcnt.
+ */
+static void
+RelationRebuildRelation(Relation relation)
+{
+	Assert(!RelationHasReferenceCountZero(relation));
+	/* rebuilding requires access to the catalogs */
+	Assert(IsTransactionState());
+	/* there is no reason to ever rebuild a dropped relation */
+	Assert(relation->rd_droppedSubid == InvalidSubTransactionId);
+
+	/* Close and mark it as invalid until we've finished the rebuild */
+	RelationInvalidateRelation(relation);
 
 	/*
-	 * Make sure smgr and lower levels close the relation's files, if they
-	 * weren't closed already.  If the relation is not getting deleted, the
-	 * next smgr access should reopen the files automatically.  This ensures
-	 * that the low-level file access state is updated after, say, a vacuum
-	 * truncation.
-	 */
-	RelationCloseSmgr(relation);
-
-	/* Free AM cached data, if any */
-	if (relation->rd_amcache)
-		pfree(relation->rd_amcache);
-	relation->rd_amcache = NULL;
-
-	/*
-	 * Treat nailed-in system relations separately, they always need to be
-	 * accessible, so we can't blow them away.
-	 */
-	if (relation->rd_isnailed)
-	{
-		RelationReloadNailed(relation);
-		return;
-	}
-
-	/* Mark it invalid until we've finished rebuild */
-	relation->rd_isvalid = false;
-
-	/* See RelationForgetRelation(). */
-	if (relation->rd_droppedSubid != InvalidSubTransactionId)
-		return;
-
-	/*
-	 * Even non-system indexes should not be blown away if they are open and
-	 * have valid index support information.  This avoids problems with active
-	 * use of the index support information.  As with nailed indexes, we
-	 * re-read the pg_class row to handle possible physical relocation of the
-	 * index, and we check for pg_index updates too.
+	 * Indexes only have a limited number of possible schema changes, and we
+	 * don't want to use the full-blown procedure because it's a headache for
+	 * indexes that reload itself depends on.
+	 *
+	 * As an exception, use the full procedure if the index access info hasn't
+	 * been initialized yet.  Index creation relies on that: it first builds
+	 * the relcache entry with RelationBuildLocalRelation(), creates the
+	 * pg_index tuple only after that, and then relies on
+	 * CommandCounterIncrement to load the pg_index contents.
 	 */
 	if ((relation->rd_rel->relkind == RELKIND_INDEX ||
 		 relation->rd_rel->relkind == RELKIND_PARTITIONED_INDEX) &&
-		relation->rd_refcnt > 0 &&
 		relation->rd_indexcxt != NULL)
 	{
-		if (IsTransactionState())
-			RelationReloadIndexInfo(relation);
+		RelationReloadIndexInfo(relation);
 		return;
 	}
-
-	/*
-	 * If we're really done with the relcache entry, blow it away. But if
-	 * someone is still using it, reconstruct the whole deal without moving
-	 * the physical RelationData record (so that the someone's pointer is
-	 * still valid).
-	 */
-	if (!rebuild)
+	/* Nailed relations are handled separately. */
+	else if (relation->rd_isnailed)
 	{
-		/* Remove it from the hash table */
-		RelationCacheDelete(relation);
-
-		/* And release storage */
-		RelationDestroyRelation(relation, false);
-	}
-	else if (!IsTransactionState())
-	{
-		/*
-		 * If we're not inside a valid transaction, we can't do any catalog
-		 * access so it's not possible to rebuild yet.  Just exit, leaving
-		 * rd_isvalid = false so that the rebuild will occur when the entry is
-		 * next opened.
-		 *
-		 * Note: it's possible that we come here during subtransaction abort,
-		 * and the reason for wanting to rebuild is that the rel is open in
-		 * the outer transaction.  In that case it might seem unsafe to not
-		 * rebuild immediately, since whatever code has the rel already open
-		 * will keep on using the relcache entry as-is.  However, in such a
-		 * case the outer transaction should be holding a lock that's
-		 * sufficient to prevent any significant change in the rel's schema,
-		 * so the existing entry contents should be good enough for its
-		 * purposes; at worst we might be behind on statistics updates or the
-		 * like.  (See also CheckTableNotInUse() and its callers.)	These same
-		 * remarks also apply to the cases above where we exit without having
-		 * done RelationReloadIndexInfo() yet.
-		 */
+		RelationReloadNailed(relation);
 		return;
 	}
 	else
@@ -2879,28 +2808,47 @@ RelationFlushRelation(Relation relation)
 			 * that the current transaction has some lock on the rel already.
 			 */
 			RelationIncrementReferenceCount(relation);
-			RelationClearRelation(relation, true);
+			RelationRebuildRelation(relation);
 			RelationDecrementReferenceCount(relation);
 		}
 		else
-		{
-			/*
-			 * During abort processing, the current resource owner is not
-			 * valid and we cannot hold a refcnt.  Without a valid
-			 * transaction, RelationClearRelation() would just mark the rel as
-			 * invalid anyway, so we can do the same directly.
-			 */
 			RelationInvalidateRelation(relation);
-		}
 	}
 	else
 	{
 		/*
 		 * Pre-existing rels can be dropped from the relcache if not open.
+		 *
+		 * If the entry is in use, rebuild it if possible.  If we're not
+		 * inside a valid transaction, we can't do any catalog access so it's
+		 * not possible to rebuild yet.  Just mark it as invalid in that case,
+		 * so that the rebuild will occur when the entry is next opened.
+		 *
+		 * Note: it's possible that we come here during subtransaction abort,
+		 * and the reason for wanting to rebuild is that the rel is open in
+		 * the outer transaction.  In that case it might seem unsafe to not
+		 * rebuild immediately, since whatever code has the rel already open
+		 * will keep on using the relcache entry as-is.  However, in such a
+		 * case the outer transaction should be holding a lock that's
+		 * sufficient to prevent any significant change in the rel's schema,
+		 * so the existing entry contents should be good enough for its
+		 * purposes; at worst we might be behind on statistics updates or the
+		 * like.  (See also CheckTableNotInUse() and its callers.)
 		 */
-		bool		rebuild = !RelationHasReferenceCountZero(relation);
-
-		RelationClearRelation(relation, rebuild);
+		if (RelationHasReferenceCountZero(relation))
+			RelationClearRelation(relation);
+		else if (!IsTransactionState())
+			RelationInvalidateRelation(relation);
+		else if (relation->rd_isnailed && relation->rd_refcnt == 1)
+		{
+			/*
+			 * A nailed relation with refcnt == 1 is unused.  We cannot clear
+			 * it, but there's also no need no need to rebuild it immediately.
+			 */
+			RelationInvalidateRelation(relation);
+		}
+		else
+			RelationRebuildRelation(relation);
 	}
 }
 
@@ -2926,14 +2874,15 @@ RelationForgetRelation(Oid rid)
 	{
 		/*
 		 * In the event of subtransaction rollback, we must not forget
-		 * rd_*Subid.  Mark the entry "dropped" so RelationClearRelation()
-		 * invalidates it in lieu of destroying it.  (If we're in a top
-		 * transaction, we could opt to destroy the entry.)
+		 * rd_*Subid.  Mark the entry "dropped" and invalidate it, instead of
+		 * destroying it right away.  (If we're in a top transaction, we could
+		 * opt to destroy the entry.)
 		 */
 		relation->rd_droppedSubid = GetCurrentSubTransactionId();
+		RelationInvalidateRelation(relation);
 	}
-
-	RelationClearRelation(relation, false);
+	else
+		RelationClearRelation(relation);
 }
 
 /*
@@ -3045,8 +2994,7 @@ RelationCacheInvalidate(bool debug_discard)
 		if (RelationHasReferenceCountZero(relation))
 		{
 			/* Delete this entry immediately */
-			Assert(!relation->rd_isnailed);
-			RelationClearRelation(relation, false);
+			RelationClearRelation(relation);
 		}
 		else
 		{
@@ -3089,17 +3037,26 @@ RelationCacheInvalidate(bool debug_discard)
 	 */
 	smgrreleaseall();
 
-	/* Phase 2: rebuild the items found to need rebuild in phase 1 */
+	/*
+	 * Phase 2: rebuild (or invalidate) the items found to need rebuild in
+	 * phase 1
+	 */
 	foreach(l, rebuildFirstList)
 	{
 		relation = (Relation) lfirst(l);
-		RelationClearRelation(relation, true);
+		if (!IsTransactionState() || (relation->rd_isnailed && relation->rd_refcnt == 1))
+			RelationInvalidateRelation(relation);
+		else
+			RelationRebuildRelation(relation);
 	}
 	list_free(rebuildFirstList);
 	foreach(l, rebuildList)
 	{
 		relation = (Relation) lfirst(l);
-		RelationClearRelation(relation, true);
+		if (!IsTransactionState() || (relation->rd_isnailed && relation->rd_refcnt == 1))
+			RelationInvalidateRelation(relation);
+		else
+			RelationRebuildRelation(relation);
 	}
 	list_free(rebuildList);
 
@@ -3357,7 +3314,7 @@ AtEOXact_cleanup(Relation relation, bool isCommit)
 	{
 		if (RelationHasReferenceCountZero(relation))
 		{
-			RelationClearRelation(relation, false);
+			RelationClearRelation(relation);
 			return;
 		}
 		else
@@ -3467,7 +3424,7 @@ AtEOSubXact_cleanup(Relation relation, bool isCommit,
 			relation->rd_newRelfilelocatorSubid = InvalidSubTransactionId;
 			relation->rd_firstRelfilelocatorSubid = InvalidSubTransactionId;
 			relation->rd_droppedSubid = InvalidSubTransactionId;
-			RelationClearRelation(relation, false);
+			RelationClearRelation(relation);
 			return;
 		}
 		else
@@ -3719,6 +3676,12 @@ RelationBuildLocalRelation(const char *relname,
 
 	if (RELKIND_HAS_TABLE_AM(relkind) || relkind == RELKIND_SEQUENCE)
 		RelationInitTableAccessMethod(rel);
+
+	/*
+	 * Leave index access method uninitialized, because the pg_index row has
+	 * not been inserted at this stage of index creation yet.  The cache
+	 * invalidation after pg_index row has been inserted will initialize it.
+	 */
 
 	/*
 	 * Okay to insert into the relcache hash table.
@@ -4854,18 +4817,38 @@ RelationGetIndexList(Relation relation)
 		result = lappend_oid(result, index->indexrelid);
 
 		/*
-		 * Invalid, non-unique, non-immediate or predicate indexes aren't
-		 * interesting for either oid indexes or replication identity indexes,
-		 * so don't check them.
+		 * Non-unique or predicate indexes aren't interesting for either oid
+		 * indexes or replication identity indexes, so don't check them.
+		 * Deferred ones are not useful for replication identity either; but
+		 * we do include them if they are PKs.
 		 */
-		if (!index->indisvalid || !index->indisunique ||
-			!index->indimmediate ||
+		if (!index->indisunique ||
 			!heap_attisnull(htup, Anum_pg_index_indpred, NULL))
 			continue;
 
-		/* remember primary key index if any */
-		if (index->indisprimary)
+		/*
+		 * Remember primary key index, if any.  For regular tables we do this
+		 * only if the index is valid; but for partitioned tables, then we do
+		 * it even if it's invalid.
+		 *
+		 * The reason for returning invalid primary keys for partitioned
+		 * tables is that we need it to prevent drop of not-null constraints
+		 * that may underlie such a primary key, which is only a problem for
+		 * partitioned tables.
+		 */
+		if (index->indisprimary &&
+			(index->indisvalid ||
+			 relation->rd_rel->relkind == RELKIND_PARTITIONED_TABLE))
+		{
 			pkeyIndex = index->indexrelid;
+			pkdeferrable = !index->indimmediate;
+		}
+
+		if (!index->indimmediate)
+			continue;
+
+		if (!index->indisvalid)
+			continue;
 
 		/* remember explicitly chosen replica index */
 		if (index->indisreplident)
@@ -4989,10 +4972,10 @@ RelationGetStatExtList(Relation relation)
  * RelationGetPrimaryKeyIndex -- get OID of the relation's primary key index
  *
  * Returns InvalidOid if there is no such index, or if the primary key is
- * DEFERRABLE.
+ * DEFERRABLE and the caller isn't OK with that.
  */
 Oid
-RelationGetPrimaryKeyIndex(Relation relation)
+RelationGetPrimaryKeyIndex(Relation relation, bool deferrable_ok)
 {
 	List	   *ilist;
 
@@ -5004,7 +4987,11 @@ RelationGetPrimaryKeyIndex(Relation relation)
 		Assert(relation->rd_indexvalid);
 	}
 
-	return relation->rd_ispkdeferrable ? InvalidOid : relation->rd_pkindex;
+	if (deferrable_ok)
+		return relation->rd_pkindex;
+	else if (relation->rd_ispkdeferrable)
+		return InvalidOid;
+	return relation->rd_pkindex;
 }
 
 /*

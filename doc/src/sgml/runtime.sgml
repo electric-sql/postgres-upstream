@@ -637,7 +637,8 @@ psql: error: connection to server at "server.joe.com" (123.123.123.123), port 54
      This is the generic <quote>I couldn't find a server to talk
      to</quote> failure. It looks like the above when TCP/IP
      communication is attempted. A common mistake is to forget to
-     configure the server to allow TCP/IP connections.
+     configure <xref linkend="guc-listen-addresses"/> so that the server
+     accepts remote TCP connections.
     </para>
 
     <para>
@@ -1429,11 +1430,10 @@ export PG_OOM_ADJUST_VALUE=0
     with <varname>CONFIG_HUGETLBFS=y</varname> and
     <varname>CONFIG_HUGETLB_PAGE=y</varname>. You will also have to configure
     the operating system to provide enough huge pages of the desired size.
-    To determine the number of huge pages needed, use the
-    <command>postgres</command> command to see the value of
-    <xref linkend="guc-shared-memory-size-in-huge-pages"/>.  Note that the
-    server must be shut down to view this runtime-computed parameter.
-    This might look like:
+    The runtime-computed parameter
+    <xref linkend="guc-shared-memory-size-in-huge-pages"/> reports the number
+    of huge pages required.  This parameter can be viewed before starting the
+    server with a <command>postgres</command> command like:
 <programlisting>
 $ <userinput>postgres -D $PGDATA -C shared_memory_size_in_huge_pages</userinput>
 3170

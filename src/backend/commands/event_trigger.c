@@ -975,11 +975,6 @@ EventTriggerOnLogin(void)
 				 * this instead of regular updates serves two purposes. First,
 				 * that avoids possible waiting on the row-level lock. Second,
 				 * that avoids dealing with TOAST.
-				 *
-				 * Changes made by inplace update may be lost due to
-				 * concurrent normal updates; see inplace-inval.spec. However,
-				 * we are OK with that.  The subsequent connections will still
-				 * have a chance to set "dathasloginevt" to false.
 				 */
 				systable_inplace_update_finish(state, tuple);
 			}
@@ -1128,7 +1123,7 @@ EventTriggerInvoke(List *fn_oid_list, EventTriggerData *trigdata)
 /*
  * Do event triggers support this object type?
  *
- * See also event trigger support matrix in event-trigger.sgml.
+ * See also event trigger documentation in event-trigger.sgml.
  */
 bool
 EventTriggerSupportsObjectType(ObjectType obtype)
@@ -1152,7 +1147,7 @@ EventTriggerSupportsObjectType(ObjectType obtype)
 /*
  * Do event triggers support this object class?
  *
- * See also event trigger support matrix in event-trigger.sgml.
+ * See also event trigger documentation in event-trigger.sgml.
  */
 bool
 EventTriggerSupportsObject(const ObjectAddress *object)

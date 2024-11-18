@@ -1361,12 +1361,8 @@ if sslopt in ['auto', 'openssl']
       ['CRYPTO_new_ex_data', {'required': true}],
       ['SSL_new', {'required': true}],
 
-      # Functions introduced in OpenSSL 1.1.0. We used to check for
-      # OPENSSL_VERSION_NUMBER, but that didn't work with 1.1.0, because LibreSSL
-      # defines OPENSSL_VERSION_NUMBER to claim version 2.0.0, even though it
-      # doesn't have these OpenSSL 1.1.0 functions. So check for individual
-      # functions.
-      ['OPENSSL_init_ssl', {'required': true}],
+      # Functions introduced in OpenSSL 1.1.1.
+      ['SSL_CTX_set_ciphersuites', {'required': true}],
 
       # Function introduced in OpenSSL 1.0.2, not in LibreSSL.
       ['SSL_CTX_set_cert_cb'],
@@ -1395,7 +1391,7 @@ if sslopt in ['auto', 'openssl']
     if are_openssl_funcs_complete
       cdata.set('USE_OPENSSL', 1,
                 description: 'Define to 1 to build with OpenSSL support. (-Dssl=openssl)')
-      cdata.set('OPENSSL_API_COMPAT', '0x10100000L',
+      cdata.set('OPENSSL_API_COMPAT', '0x10101000L',
                 description: 'Define to the OpenSSL API version in use. This avoids deprecation warnings from newer OpenSSL versions.')
       ssl_library = 'openssl'
     else
@@ -2157,25 +2153,22 @@ endforeach
 # Check for the availability of XSAVE intrinsics.
 ###############################################################
 
-cflags_xsave = []
 if host_cpu == 'x86' or host_cpu == 'x86_64'
 
   prog = '''
 #include <immintrin.h>
 
+#if defined(__has_attribute) && __has_attribute (target)
+__attribute__((target("xsave")))
+#endif
 int main(void)
 {
     return _xgetbv(0) & 0xe0;
 }
 '''
 
-  if cc.links(prog, name: 'XSAVE intrinsics without -mxsave',
-        args: test_c_args)
+  if cc.links(prog, name: 'XSAVE intrinsics', args: test_c_args)
     cdata.set('HAVE_XSAVE_INTRINSICS', 1)
-  elif cc.links(prog, name: 'XSAVE intrinsics with -mxsave',
-        args: test_c_args + ['-mxsave'])
-    cdata.set('HAVE_XSAVE_INTRINSICS', 1)
-    cflags_xsave += '-mxsave'
   endif
 
 endif
@@ -2185,12 +2178,14 @@ endif
 # Check for the availability of AVX-512 popcount intrinsics.
 ###############################################################
 
-cflags_popcnt = []
 if host_cpu == 'x86_64'
 
   prog = '''
 #include <immintrin.h>
 
+#if defined(__has_attribute) && __has_attribute (target)
+__attribute__((target("avx512vpopcntdq,avx512bw")))
+#endif
 int main(void)
 {
     const char buf[sizeof(__m512i)];
@@ -2205,13 +2200,9 @@ int main(void)
 }
 '''
 
-  if cc.links(prog, name: 'AVX-512 popcount without -mavx512vpopcntdq -mavx512bw',
+  if cc.links(prog, name: 'AVX-512 popcount',
         args: test_c_args + ['-DINT64=@0@'.format(cdata.get('PG_INT64_TYPE'))])
     cdata.set('USE_AVX512_POPCNT_WITH_RUNTIME_CHECK', 1)
-  elif cc.links(prog, name: 'AVX-512 popcount with -mavx512vpopcntdq -mavx512bw',
-        args: test_c_args + ['-DINT64=@0@'.format(cdata.get('PG_INT64_TYPE'))] + ['-mavx512vpopcntdq'] + ['-mavx512bw'])
-    cdata.set('USE_AVX512_POPCNT_WITH_RUNTIME_CHECK', 1)
-    cflags_popcnt += ['-mavx512vpopcntdq'] + ['-mavx512bw']
   endif
 
 endif
@@ -3293,11 +3284,6 @@ test_env.set('PG_REGRESS', pg_regress.full_path())
 test_env.set('REGRESS_SHLIB', regress_module.full_path())
 test_env.set('INITDB_TEMPLATE', test_initdb_template)
 
-# Test suites that are not safe by default but can be run if selected
-# by the user via the whitespace-separated list in variable PG_TEST_EXTRA.
-# Export PG_TEST_EXTRA so it can be checked in individual tap tests.
-test_env.set('PG_TEST_EXTRA', get_option('PG_TEST_EXTRA'))
-
 # Add the temporary installation to the library search path on platforms where
 # that works (everything but windows, basically). On windows everything
 # library-like gets installed into bindir, solving that issue.
@@ -3361,6 +3347,11 @@ foreach test_dir : tests
     testwrap,
     '--basedir', meson.build_root(),
     '--srcdir', test_dir['sd'],
+    # Some test suites are not run by default but can be run if selected by the
+    # user via variable PG_TEST_EXTRA. Pass configuration time value of
+    # PG_TEST_EXTRA as an argument to testwrap so that it can be overridden by
+    # run time value, if any.
+    '--pg-test-extra', get_option('PG_TEST_EXTRA'),
   ]
 
   foreach kind, v : test_dir

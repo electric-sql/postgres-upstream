@@ -27,7 +27,6 @@
 #include "fe_utils/print.h"
 #include "fe_utils/string_utils.h"
 #include "settings.h"
-#include "variables.h"
 
 static const char *map_typename_pattern(const char *pattern);
 static bool describeOneTableDetails(const char *schemaname,
@@ -1970,12 +1969,8 @@ describeOneTableDetails(const char *schemaname,
 							  schemaname, relationname);
 			break;
 		case RELKIND_MATVIEW:
-			if (tableinfo.relpersistence == 'u')
-				printfPQExpBuffer(&title, _("Unlogged materialized view \"%s.%s\""),
-								  schemaname, relationname);
-			else
-				printfPQExpBuffer(&title, _("Materialized view \"%s.%s\""),
-								  schemaname, relationname);
+			printfPQExpBuffer(&title, _("Materialized view \"%s.%s\""),
+							  schemaname, relationname);
 			break;
 		case RELKIND_INDEX:
 			if (tableinfo.relpersistence == 'u')
@@ -3053,6 +3048,50 @@ describeOneTableDetails(const char *schemaname,
 				if (!PQgetisnull(result, i, 1))
 					appendPQExpBuffer(&buf, " WHERE %s",
 									  PQgetvalue(result, i, 1));
+
+				printTableAddFooter(&cont, buf.data);
+			}
+			PQclear(result);
+		}
+
+		/*
+		 * If verbose, print NOT NULL constraints.
+		 */
+		if (verbose)
+		{
+			printfPQExpBuffer(&buf,
+							  "SELECT c.conname, a.attname, c.connoinherit,\n"
+							  "  c.conislocal, c.coninhcount <> 0\n"
+							  "FROM pg_catalog.pg_constraint c JOIN\n"
+							  "  pg_catalog.pg_attribute a ON\n"
+							  "    (a.attrelid = c.conrelid AND a.attnum = c.conkey[1])\n"
+							  "WHERE c.contype = 'n' AND\n"
+							  "  c.conrelid = '%s'::pg_catalog.regclass\n"
+							  "ORDER BY a.attnum",
+							  oid);
+
+			result = PSQLexec(buf.data);
+			if (!result)
+				goto error_return;
+			else
+				tuples = PQntuples(result);
+
+			if (tuples > 0)
+				printTableAddFooter(&cont, _("Not-null constraints:"));
+
+			/* Might be an empty set - that's ok */
+			for (i = 0; i < tuples; i++)
+			{
+				bool		islocal = PQgetvalue(result, i, 3)[0] == 't';
+				bool		inherited = PQgetvalue(result, i, 4)[0] == 't';
+
+				printfPQExpBuffer(&buf, "    \"%s\" NOT NULL \"%s\"%s",
+								  PQgetvalue(result, i, 0),
+								  PQgetvalue(result, i, 1),
+								  PQgetvalue(result, i, 2)[0] == 't' ?
+								  " NO INHERIT" :
+								  islocal && inherited ? _(" (local, inherited)") :
+								  inherited ? _(" (inherited)") : "");
 
 				printTableAddFooter(&cont, buf.data);
 			}
@@ -6237,7 +6276,7 @@ listPublications(const char *pattern)
 	PQExpBufferData buf;
 	PGresult   *res;
 	printQueryOpt myopt = pset.popt;
-	static const bool translate_columns[] = {false, false, false, false, false, false, false, false};
+	static const bool translate_columns[] = {false, false, false, false, false, false, false, false, false};
 
 	if (pset.sversion < 100000)
 	{
@@ -6268,6 +6307,10 @@ listPublications(const char *pattern)
 		appendPQExpBuffer(&buf,
 						  ",\n  pubtruncate AS \"%s\"",
 						  gettext_noop("Truncates"));
+	if (pset.sversion >= 180000)
+		appendPQExpBuffer(&buf,
+						  ",\n  pubgencols AS \"%s\"",
+						  gettext_noop("Generated columns"));
 	if (pset.sversion >= 130000)
 		appendPQExpBuffer(&buf,
 						  ",\n  pubviaroot AS \"%s\"",
@@ -6360,6 +6403,7 @@ describePublications(const char *pattern)
 	int			i;
 	PGresult   *res;
 	bool		has_pubtruncate;
+	bool		has_pubgencols;
 	bool		has_pubviaroot;
 
 	PQExpBufferData title;
@@ -6376,6 +6420,7 @@ describePublications(const char *pattern)
 	}
 
 	has_pubtruncate = (pset.sversion >= 110000);
+	has_pubgencols = (pset.sversion >= 180000);
 	has_pubviaroot = (pset.sversion >= 130000);
 
 	initPQExpBuffer(&buf);
@@ -6387,9 +6432,13 @@ describePublications(const char *pattern)
 	if (has_pubtruncate)
 		appendPQExpBufferStr(&buf,
 							 ", pubtruncate");
+	if (has_pubgencols)
+		appendPQExpBufferStr(&buf,
+							 ", pubgencols");
 	if (has_pubviaroot)
 		appendPQExpBufferStr(&buf,
 							 ", pubviaroot");
+
 	appendPQExpBufferStr(&buf,
 						 "\nFROM pg_catalog.pg_publication\n");
 
@@ -6439,6 +6488,8 @@ describePublications(const char *pattern)
 
 		if (has_pubtruncate)
 			ncols++;
+		if (has_pubgencols)
+			ncols++;
 		if (has_pubviaroot)
 			ncols++;
 
@@ -6453,6 +6504,8 @@ describePublications(const char *pattern)
 		printTableAddHeader(&cont, gettext_noop("Deletes"), true, align);
 		if (has_pubtruncate)
 			printTableAddHeader(&cont, gettext_noop("Truncates"), true, align);
+		if (has_pubgencols)
+			printTableAddHeader(&cont, gettext_noop("Generated columns"), true, align);
 		if (has_pubviaroot)
 			printTableAddHeader(&cont, gettext_noop("Via root"), true, align);
 
@@ -6463,8 +6516,10 @@ describePublications(const char *pattern)
 		printTableAddCell(&cont, PQgetvalue(res, i, 6), false, false);
 		if (has_pubtruncate)
 			printTableAddCell(&cont, PQgetvalue(res, i, 7), false, false);
-		if (has_pubviaroot)
+		if (has_pubgencols)
 			printTableAddCell(&cont, PQgetvalue(res, i, 8), false, false);
+		if (has_pubviaroot)
+			printTableAddCell(&cont, PQgetvalue(res, i, 9), false, false);
 
 		if (!puballtables)
 		{

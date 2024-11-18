@@ -796,7 +796,7 @@ typedef struct ExecAuxRowMark
  * All-in-memory tuple hash tables are used for a number of purposes.
  *
  * Note: tab_hash_funcs are for the key datatype(s) stored in the table,
- * and tab_eq_funcs are non-cross-type equality operators for those types.
+ * and tab_eq_func are non-cross-type equality operators for those types.
  * Normally these are the only functions used, but FindTupleHashEntry()
  * supports searching a hashtable using cross-data-type hashing.  For that,
  * the caller must supply hash functions for the LHS datatype as well as
@@ -994,7 +994,6 @@ typedef struct SubPlanState
 									 * datatype(s) */
 	Oid		   *tab_collations; /* collations for hash and comparison */
 	FmgrInfo   *tab_hash_funcs; /* hash functions for table datatype(s) */
-	FmgrInfo   *tab_eq_funcs;	/* equality functions for table datatype(s) */
 	FmgrInfo   *lhs_hash_funcs; /* hash functions for lefthand datatype(s) */
 	FmgrInfo   *cur_eq_funcs;	/* equality functions for LHS vs. table */
 	ExprState  *cur_eq_comp;	/* equality comparator for LHS vs. table */
@@ -1833,8 +1832,6 @@ typedef struct SharedBitmapHeapInstrumentation
  *
  *		bitmapqualorig	   execution state for bitmapqualorig expressions
  *		tbm				   bitmap obtained from child index scan(s)
- *		tbmiterator		   iterator for scanning current pages
- *		tbmres			   current-page data
  *		pvmbuffer		   buffer for visibility-map lookups of prefetched pages
  *		stats			   execution statistics
  *		prefetch_iterator  iterator for prefetching ahead of current page
@@ -1842,10 +1839,12 @@ typedef struct SharedBitmapHeapInstrumentation
  *		prefetch_target    current target prefetch distance
  *		prefetch_maximum   maximum value for prefetch_target
  *		initialized		   is node is ready to iterate
- *		shared_tbmiterator	   shared iterator
  *		shared_prefetch_iterator shared iterator for prefetching
  *		pstate			   shared state for parallel bitmap scan
  *		sinstrument		   statistics for parallel workers
+ *		recheck			   do current page's tuples need recheck
+ *		blockno			   used to validate pf and current block stay in sync
+ *		prefetch_blockno   used to validate pf stays ahead of current block
  * ----------------
  */
 typedef struct BitmapHeapScanState
@@ -1853,8 +1852,6 @@ typedef struct BitmapHeapScanState
 	ScanState	ss;				/* its first field is NodeTag */
 	ExprState  *bitmapqualorig;
 	TIDBitmap  *tbm;
-	TBMIterator *tbmiterator;
-	TBMIterateResult *tbmres;
 	Buffer		pvmbuffer;
 	BitmapHeapScanInstrumentation stats;
 	TBMIterator *prefetch_iterator;
@@ -1862,10 +1859,12 @@ typedef struct BitmapHeapScanState
 	int			prefetch_target;
 	int			prefetch_maximum;
 	bool		initialized;
-	TBMSharedIterator *shared_tbmiterator;
 	TBMSharedIterator *shared_prefetch_iterator;
 	ParallelBitmapHeapState *pstate;
 	SharedBitmapHeapInstrumentation *sinstrument;
+	bool		recheck;
+	BlockNumber blockno;
+	BlockNumber prefetch_blockno;
 } BitmapHeapScanState;
 
 /* ----------------

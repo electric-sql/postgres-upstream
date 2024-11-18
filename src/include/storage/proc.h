@@ -418,10 +418,14 @@ typedef struct PROC_HDR
 	pg_atomic_uint32 procArrayGroupFirst;
 	/* First pgproc waiting for group transaction status update */
 	pg_atomic_uint32 clogGroupFirst;
-	/* WALWriter process's latch */
-	Latch	   *walwriterLatch;
-	/* Checkpointer process's latch */
-	Latch	   *checkpointerLatch;
+
+	/*
+	 * Current slot numbers of some auxiliary processes. There can be only one
+	 * of each of these running at a time.
+	 */
+	ProcNumber	walwriterProc;
+	ProcNumber	checkpointerProc;
+
 	/* Current shared estimate of appropriate spins_per_delay value */
 	int			spins_per_delay;
 	/* Buffer id of the buffer that Startup process waits for pin on, or -1 */
@@ -480,13 +484,12 @@ extern int	GetStartupBufferPinWaitBufId(void);
 extern bool HaveNFreeProcs(int n, int *nfree);
 extern void ProcReleaseLocks(bool isCommit);
 
-extern ProcWaitStatus ProcSleep(LOCALLOCK *locallock,
-								LockMethod lockMethodTable,
-								bool dontWait);
+extern ProcWaitStatus JoinWaitQueue(LOCALLOCK *locallock,
+									LockMethod lockMethodTable, bool dontWait);
+extern ProcWaitStatus ProcSleep(LOCALLOCK *locallock);
 extern void ProcWakeup(PGPROC *proc, ProcWaitStatus waitStatus);
 extern void ProcLockWakeup(LockMethod lockMethodTable, LOCK *lock);
 extern void CheckDeadLockAlert(void);
-extern bool IsWaitingForLock(void);
 extern void LockErrorCleanup(void);
 
 extern void ProcWaitForSignal(uint32 wait_event_info);

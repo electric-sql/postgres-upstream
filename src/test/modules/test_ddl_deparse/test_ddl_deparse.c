@@ -10,7 +10,6 @@
  */
 #include "postgres.h"
 
-#include "catalog/pg_type.h"
 #include "funcapi.h"
 #include "nodes/execnodes.h"
 #include "tcop/deparse_utility.h"
@@ -134,9 +133,6 @@ get_altertable_subcmdinfo(PG_FUNCTION_ARGS)
 				break;
 			case AT_DropExpression:
 				strtype = "DROP EXPRESSION";
-				break;
-			case AT_CheckNotNull:
-				strtype = "CHECK NOT NULL";
 				break;
 			case AT_SetStatistics:
 				strtype = "SET STATS";

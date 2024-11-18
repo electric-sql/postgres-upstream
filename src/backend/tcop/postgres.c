@@ -53,7 +53,6 @@
 #include "pg_getopt.h"
 #include "pg_trace.h"
 #include "pgstat.h"
-#include "postmaster/autovacuum.h"
 #include "postmaster/interrupt.h"
 #include "postmaster/postmaster.h"
 #include "replication/logicallauncher.h"
@@ -3086,7 +3085,7 @@ ProcessRecoveryConflictInterrupt(ProcSignalReason reason)
 			/*
 			 * If we aren't waiting for a lock we can never deadlock.
 			 */
-			if (!IsWaitingForLock())
+			if (GetAwaitedLock() == NULL)
 				return;
 
 			/* Intentional fall through to check wait for pin */
@@ -4189,6 +4188,12 @@ PostgresSingleUserMain(int argc, char *argv[],
 
 	/* Initialize MaxBackends */
 	InitializeMaxBackends();
+
+	/*
+	 * We don't need postmaster child slots in single-user mode, but
+	 * initialize them anyway to avoid having special handling.
+	 */
+	InitPostmasterChildSlots();
 
 	/* Initialize size of fast-path lock cache. */
 	InitializeFastPathLocks();

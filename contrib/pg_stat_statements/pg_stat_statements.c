@@ -49,7 +49,6 @@
 
 #include "access/parallel.h"
 #include "catalog/pg_authid.h"
-#include "common/hashfn.h"
 #include "common/int.h"
 #include "executor/instrument.h"
 #include "funcapi.h"
@@ -59,9 +58,7 @@
 #include "nodes/queryjumble.h"
 #include "optimizer/planner.h"
 #include "parser/analyze.h"
-#include "parser/parsetree.h"
 #include "parser/scanner.h"
-#include "parser/scansup.h"
 #include "pgstat.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
@@ -1872,9 +1869,14 @@ pg_stat_statements_internal(FunctionCallInfo fcinfo,
 		/* copy counters to a local variable to keep locking time short */
 		SpinLockAcquire(&entry->mutex);
 		tmp = entry->counters;
+		SpinLockRelease(&entry->mutex);
+
+		/*
+		 * The spinlock is not required when reading these two as they are
+		 * always updated when holding pgss->lock exclusively.
+		 */
 		stats_since = entry->stats_since;
 		minmax_stats_since = entry->minmax_stats_since;
-		SpinLockRelease(&entry->mutex);
 
 		/* Skip entry if unexecuted (ie, it's a pending "sticky" entry) */
 		if (IS_STICKY(tmp))

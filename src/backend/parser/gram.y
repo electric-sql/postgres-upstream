@@ -48,7 +48,6 @@
 #include <ctype.h>
 #include <limits.h>
 
-#include "access/tableam.h"
 #include "catalog/index.h"
 #include "catalog/namespace.h"
 #include "catalog/pg_am.h"
@@ -59,46 +58,29 @@
 #include "nodes/makefuncs.h"
 #include "nodes/nodeFuncs.h"
 #include "parser/parser.h"
-#include "storage/lmgr.h"
-#include "utils/date.h"
 #include "utils/datetime.h"
-#include "utils/numeric.h"
 #include "utils/xml.h"
 
 
 /*
- * Location tracking support --- simpler than bison's default, since we only
- * want to track the start position not the end position of each nonterminal.
+ * Location tracking support.  Unlike bison's default, we only want
+ * to track the start position not the end position of each nonterminal.
+ * Nonterminals that reduce to empty receive position "-1".  Since a
+ * production's leading RHS nonterminal(s) may have reduced to empty,
+ * we have to scan to find the first one that's not -1.
  */
 #define YYLLOC_DEFAULT(Current, Rhs, N) \
 	do { \
-		if ((N) > 0) \
-			(Current) = (Rhs)[1]; \
-		else \
-			(Current) = (-1); \
+		(Current) = (-1); \
+		for (int _i = 1; _i <= (N); _i++) \
+		{ \
+			if ((Rhs)[_i] >= 0) \
+			{ \
+				(Current) = (Rhs)[_i]; \
+				break; \
+			} \
+		} \
 	} while (0)
-
-/*
- * The above macro assigns -1 (unknown) as the parse location of any
- * nonterminal that was reduced from an empty rule, or whose leftmost
- * component was reduced from an empty rule.  This is problematic
- * for nonterminals defined like
- *		OptFooList: / * EMPTY * / { ... } | OptFooList Foo { ... } ;
- * because we'll set -1 as the location during the first reduction and then
- * copy it during each subsequent reduction, leaving us with -1 for the
- * location even when the list is not empty.  To fix that, do this in the
- * action for the nonempty rule(s):
- *		if (@$ < 0) @$ = @2;
- * (Although we have many nonterminals that follow this pattern, we only
- * bother with fixing @$ like this when the nonterminal's parse location
- * is actually referenced in some rule.)
- *
- * A cleaner answer would be to make YYLLOC_DEFAULT scan all the Rhs
- * locations until it's found one that's not -1.  Then we'd get a correct
- * location for any nonterminal that isn't entirely empty.  But this way
- * would add overhead to every rule reduction, and so far there's not been
- * a compelling reason to pay that overhead.
- */
 
 /*
  * Bison doesn't allocate anything that needs to live across parser calls,
@@ -123,12 +105,15 @@ typedef struct ImportQual
 	List	   *table_names;
 } ImportQual;
 
-/* Private struct for the result of opt_select_limit production */
+/* Private struct for the result of select_limit & limit_clause productions */
 typedef struct SelectLimit
 {
 	Node	   *limitOffset;
 	Node	   *limitCount;
-	LimitOption limitOption;
+	LimitOption limitOption;	/* indicates presence of WITH TIES */
+	ParseLoc	offsetLoc;		/* location of OFFSET token, if present */
+	ParseLoc	countLoc;		/* location of LIMIT/FETCH token, if present */
+	ParseLoc	optionLoc;		/* location of WITH TIES, if present */
 } SelectLimit;
 
 /* Private struct for the result of group_clause production */
@@ -167,6 +152,7 @@ static void base_yyerror(YYLTYPE *yylloc, core_yyscan_t yyscanner,
 						 const char *msg);
 static RawStmt *makeRawStmt(Node *stmt, int stmt_location);
 static void updateRawStmtEnd(RawStmt *rs, int end_location);
+static void updatePreparableStmtEnd(Node *n, int end_location);
 static Node *makeColumnRef(char *colname, List *indirection,
 						   int location, core_yyscan_t yyscanner);
 static Node *makeTypeCast(Node *arg, TypeName *typename, int location);
@@ -190,7 +176,7 @@ static void insertSelectOptions(SelectStmt *stmt,
 								SelectLimit *limitClause,
 								WithClause *withClause,
 								core_yyscan_t yyscanner);
-static Node *makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg);
+static Node *makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg, int location);
 static Node *doNegate(Node *n, int location);
 static void doNegateFloat(Float *v);
 static Node *makeAndExpr(Node *lexpr, Node *rexpr, int location);
@@ -201,7 +187,7 @@ static Node *makeSQLValueFunction(SQLValueFunctionOp op, int32 typmod,
 								  int location);
 static Node *makeXmlExpr(XmlExprOp op, char *name, List *named_args,
 						 List *args, int location);
-static List *mergeTableFuncParameters(List *func_args, List *columns);
+static List *mergeTableFuncParameters(List *func_args, List *columns, core_yyscan_t yyscanner);
 static TypeName *TableFuncTypeName(List *columns);
 static RangeVar *makeRangeVarFromAnyName(List *names, int position, core_yyscan_t yyscanner);
 static RangeVar *makeRangeVarFromQualifiedName(char *name, List *namelist, int location,
@@ -212,7 +198,8 @@ static void SplitColQualList(List *qualList,
 static void processCASbits(int cas_bits, int location, const char *constrType,
 			   bool *deferrable, bool *initdeferred, bool *not_valid,
 			   bool *no_inherit, core_yyscan_t yyscanner);
-static PartitionStrategy parsePartitionStrategy(char *strategy);
+static PartitionStrategy parsePartitionStrategy(char *strategy, int location,
+												core_yyscan_t yyscanner);
 static void preprocess_pubobj_list(List *pubobjspec_list,
 								   core_yyscan_t yyscanner);
 static Node *makeRecursiveViewSelect(char *relname, List *aliases, Node *query);
@@ -930,7 +917,7 @@ parse_toplevel:
 			| MODE_PLPGSQL_EXPR PLpgSQL_Expr
 			{
 				pg_yyget_extra(yyscanner)->parsetree =
-					list_make1(makeRawStmt($2, 0));
+					list_make1(makeRawStmt($2, @2));
 			}
 			| MODE_PLPGSQL_ASSIGN1 PLAssignStmt
 			{
@@ -938,7 +925,7 @@ parse_toplevel:
 
 				n->nnames = 1;
 				pg_yyget_extra(yyscanner)->parsetree =
-					list_make1(makeRawStmt((Node *) n, 0));
+					list_make1(makeRawStmt((Node *) n, @2));
 			}
 			| MODE_PLPGSQL_ASSIGN2 PLAssignStmt
 			{
@@ -946,7 +933,7 @@ parse_toplevel:
 
 				n->nnames = 2;
 				pg_yyget_extra(yyscanner)->parsetree =
-					list_make1(makeRawStmt((Node *) n, 0));
+					list_make1(makeRawStmt((Node *) n, @2));
 			}
 			| MODE_PLPGSQL_ASSIGN3 PLAssignStmt
 			{
@@ -954,19 +941,15 @@ parse_toplevel:
 
 				n->nnames = 3;
 				pg_yyget_extra(yyscanner)->parsetree =
-					list_make1(makeRawStmt((Node *) n, 0));
+					list_make1(makeRawStmt((Node *) n, @2));
 			}
 		;
 
 /*
  * At top level, we wrap each stmt with a RawStmt node carrying start location
- * and length of the stmt's text.  Notice that the start loc/len are driven
- * entirely from semicolon locations (@2).  It would seem natural to use
- * @1 or @3 to get the true start location of a stmt, but that doesn't work
- * for statements that can start with empty nonterminals (opt_with_clause is
- * the main offender here); as noted in the comments for YYLLOC_DEFAULT,
- * we'd get -1 for the location in such cases.
- * We also take care to discard empty statements entirely.
+ * and length of the stmt's text.
+ * We also take care to discard empty statements entirely (which among other
+ * things dodges the problem of assigning them a location).
  */
 stmtmulti:	stmtmulti ';' toplevel_stmt
 				{
@@ -976,14 +959,14 @@ stmtmulti:	stmtmulti ';' toplevel_stmt
 						updateRawStmtEnd(llast_node(RawStmt, $1), @2);
 					}
 					if ($3 != NULL)
-						$$ = lappend($1, makeRawStmt($3, @2 + 1));
+						$$ = lappend($1, makeRawStmt($3, @3));
 					else
 						$$ = $1;
 				}
 			| toplevel_stmt
 				{
 					if ($1 != NULL)
-						$$ = list_make1(makeRawStmt($1, 0));
+						$$ = list_make1(makeRawStmt($1, @1));
 					else
 						$$ = NIL;
 				}
@@ -1584,8 +1567,6 @@ CreateSchemaStmt:
 OptSchemaEltList:
 			OptSchemaEltList schema_stmt
 				{
-					if (@$ < 0)			/* see comments for YYLLOC_DEFAULT */
-						@$ = @2;
 					$$ = lappend($1, $2);
 				}
 			| /* EMPTY */
@@ -3168,11 +3149,13 @@ PartitionBoundSpec:
 					if (n->modulus == -1)
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
-								 errmsg("modulus for hash partition must be specified")));
+								 errmsg("modulus for hash partition must be specified"),
+								 parser_errposition(@3)));
 					if (n->remainder == -1)
 						ereport(ERROR,
 								(errcode(ERRCODE_SYNTAX_ERROR),
-								 errmsg("remainder for hash partition must be specified")));
+								 errmsg("remainder for hash partition must be specified"),
+								 parser_errposition(@3)));
 
 					n->location = @3;
 
@@ -3403,6 +3386,7 @@ CopyStmt:	COPY opt_binary qualified_name opt_column_list
 				{
 					CopyStmt *n = makeNode(CopyStmt);
 
+					updatePreparableStmtEnd($3, @4);
 					n->relation = NULL;
 					n->query = $3;
 					n->attlist = NIL;
@@ -3924,12 +3908,15 @@ ColConstraint:
  * or be part of a_expr NOT LIKE or similar constructs).
  */
 ColConstraintElem:
-			NOT NULL_P
+			NOT NULL_P opt_no_inherit
 				{
 					Constraint *n = makeNode(Constraint);
 
 					n->contype = CONSTR_NOTNULL;
 					n->location = @1;
+					n->is_no_inherit = $3;
+					n->skip_validation = false;
+					n->initially_valid = true;
 					$$ = (Node *) n;
 				}
 			| NULL_P
@@ -4166,6 +4153,20 @@ ConstraintElem:
 					n->initially_valid = !n->skip_validation;
 					$$ = (Node *) n;
 				}
+			| NOT NULL_P ColId ConstraintAttributeSpec
+				{
+					Constraint *n = makeNode(Constraint);
+
+					n->contype = CONSTR_NOTNULL;
+					n->location = @1;
+					n->keys = list_make1(makeString($3));
+					/* no NOT VALID support yet */
+					processCASbits($4, @4, "NOT NULL",
+								   NULL, NULL, NULL,
+								   &n->is_no_inherit, yyscanner);
+					n->initially_valid = true;
+					$$ = (Node *) n;
+				}
 			| UNIQUE opt_unique_null_treatment '(' columnList opt_without_overlaps ')' opt_c_include opt_definition OptConsTableSpace
 				ConstraintAttributeSpec
 				{
@@ -4333,10 +4334,10 @@ DomainConstraintElem:
 					n->contype = CONSTR_NOTNULL;
 					n->location = @1;
 					n->keys = list_make1(makeString("value"));
-					/* no NOT VALID support yet */
+					/* no NOT VALID, NO INHERIT support */
 					processCASbits($3, @3, "NOT NULL",
 								   NULL, NULL, NULL,
-								   &n->is_no_inherit, yyscanner);
+								   NULL, yyscanner);
 					n->initially_valid = true;
 					$$ = (Node *) n;
 				}
@@ -4550,7 +4551,7 @@ PartitionSpec: PARTITION BY ColId '(' part_params ')'
 				{
 					PartitionSpec *n = makeNode(PartitionSpec);
 
-					n->strategy = parsePartitionStrategy($3);
+					n->strategy = parsePartitionStrategy($3, @3, yyscanner);
 					n->partParams = $5;
 					n->location = @1;
 
@@ -5984,7 +5985,8 @@ CreateTrigStmt:
 					if (n->replace) /* not supported, see CreateTrigger */
 						ereport(ERROR,
 								(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-								 errmsg("CREATE OR REPLACE CONSTRAINT TRIGGER is not supported")));
+								 errmsg("CREATE OR REPLACE CONSTRAINT TRIGGER is not supported"),
+								 parser_errposition(@1)));
 					n->isconstraint = true;
 					n->trigname = $5;
 					n->relation = $9;
@@ -6269,7 +6271,8 @@ CreateAssertionStmt:
 				{
 					ereport(ERROR,
 							(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
-							 errmsg("CREATE ASSERTION is not yet implemented")));
+							 errmsg("CREATE ASSERTION is not yet implemented"),
+							 parser_errposition(@1)));
 
 					$$ = NULL;
 				}
@@ -8312,7 +8315,7 @@ CreateFunctionStmt:
 					n->is_procedure = false;
 					n->replace = $2;
 					n->funcname = $4;
-					n->parameters = mergeTableFuncParameters($5, $9);
+					n->parameters = mergeTableFuncParameters($5, $9, yyscanner);
 					n->returnType = TableFuncTypeName($9);
 					n->returnType->location = @7;
 					n->options = $11;
@@ -8445,6 +8448,7 @@ func_arg:
 					n->argType = $3;
 					n->mode = $1;
 					n->defexpr = NULL;
+					n->location = @1;
 					$$ = n;
 				}
 			| param_name arg_class func_type
@@ -8455,6 +8459,7 @@ func_arg:
 					n->argType = $3;
 					n->mode = $2;
 					n->defexpr = NULL;
+					n->location = @1;
 					$$ = n;
 				}
 			| param_name func_type
@@ -8465,6 +8470,7 @@ func_arg:
 					n->argType = $2;
 					n->mode = FUNC_PARAM_DEFAULT;
 					n->defexpr = NULL;
+					n->location = @1;
 					$$ = n;
 				}
 			| arg_class func_type
@@ -8475,6 +8481,7 @@ func_arg:
 					n->argType = $2;
 					n->mode = $1;
 					n->defexpr = NULL;
+					n->location = @1;
 					$$ = n;
 				}
 			| func_type
@@ -8485,6 +8492,7 @@ func_arg:
 					n->argType = $1;
 					n->mode = FUNC_PARAM_DEFAULT;
 					n->defexpr = NULL;
+					n->location = @1;
 					$$ = n;
 				}
 		;
@@ -8821,6 +8829,7 @@ table_func_column:	param_name func_type
 					n->argType = $2;
 					n->mode = FUNC_PARAM_TABLE;
 					n->defexpr = NULL;
+					n->location = @1;
 					$$ = n;
 				}
 		;
@@ -12170,6 +12179,7 @@ InsertStmt:
 					$5->onConflictClause = $6;
 					$5->returningList = $7;
 					$5->withClause = $1;
+					$5->stmt_location = @$;
 					$$ = (Node *) $5;
 				}
 		;
@@ -12323,6 +12333,7 @@ DeleteStmt: opt_with_clause DELETE_P FROM relation_expr_opt_alias
 					n->whereClause = $6;
 					n->returningList = $7;
 					n->withClause = $1;
+					n->stmt_location = @$;
 					$$ = (Node *) n;
 				}
 		;
@@ -12397,6 +12408,7 @@ UpdateStmt: opt_with_clause UPDATE relation_expr_opt_alias
 					n->whereClause = $7;
 					n->returningList = $8;
 					n->withClause = $1;
+					n->stmt_location = @$;
 					$$ = (Node *) n;
 				}
 		;
@@ -12474,6 +12486,7 @@ MergeStmt:
 					m->joinCondition = $8;
 					m->mergeWhenClauses = $9;
 					m->returningList = $10;
+					m->stmt_location = @$;
 
 					$$ = (Node *) m;
 				}
@@ -12714,7 +12727,20 @@ SelectStmt: select_no_parens			%prec UMINUS
 		;
 
 select_with_parens:
-			'(' select_no_parens ')'				{ $$ = $2; }
+			'(' select_no_parens ')'
+				{
+					SelectStmt *n = (SelectStmt *) $2;
+
+					/*
+					 * As SelectStmt's location starts at the SELECT keyword,
+					 * we need to track the length of the SelectStmt within
+					 * parentheses to be able to extract the relevant part
+					 * of the query.  Without this, the RawStmt's length would
+					 * be used and would include the closing parenthesis.
+					 */
+					n->stmt_len = @3 - @2;
+					$$ = $2;
+				}
 			| '(' select_with_parens ')'			{ $$ = $2; }
 		;
 
@@ -12836,6 +12862,7 @@ simple_select:
 					n->groupDistinct = ($7)->distinct;
 					n->havingClause = $8;
 					n->windowClause = $9;
+					n->stmt_location = @1;
 					$$ = (Node *) n;
 				}
 			| SELECT distinct_clause target_list
@@ -12853,6 +12880,7 @@ simple_select:
 					n->groupDistinct = ($7)->distinct;
 					n->havingClause = $8;
 					n->windowClause = $9;
+					n->stmt_location = @1;
 					$$ = (Node *) n;
 				}
 			| values_clause							{ $$ = $1; }
@@ -12873,19 +12901,20 @@ simple_select:
 
 					n->targetList = list_make1(rt);
 					n->fromClause = list_make1($2);
+					n->stmt_location = @1;
 					$$ = (Node *) n;
 				}
 			| select_clause UNION set_quantifier select_clause
 				{
-					$$ = makeSetOp(SETOP_UNION, $3 == SET_QUANTIFIER_ALL, $1, $4);
+					$$ = makeSetOp(SETOP_UNION, $3 == SET_QUANTIFIER_ALL, $1, $4, @1);
 				}
 			| select_clause INTERSECT set_quantifier select_clause
 				{
-					$$ = makeSetOp(SETOP_INTERSECT, $3 == SET_QUANTIFIER_ALL, $1, $4);
+					$$ = makeSetOp(SETOP_INTERSECT, $3 == SET_QUANTIFIER_ALL, $1, $4, @1);
 				}
 			| select_clause EXCEPT set_quantifier select_clause
 				{
-					$$ = makeSetOp(SETOP_EXCEPT, $3 == SET_QUANTIFIER_ALL, $1, $4);
+					$$ = makeSetOp(SETOP_EXCEPT, $3 == SET_QUANTIFIER_ALL, $1, $4, @1);
 				}
 		;
 
@@ -13152,11 +13181,13 @@ select_limit:
 				{
 					$$ = $1;
 					($$)->limitOffset = $2;
+					($$)->offsetLoc = @2;
 				}
 			| offset_clause limit_clause
 				{
 					$$ = $2;
 					($$)->limitOffset = $1;
+					($$)->offsetLoc = @1;
 				}
 			| limit_clause
 				{
@@ -13169,6 +13200,9 @@ select_limit:
 					n->limitOffset = $1;
 					n->limitCount = NULL;
 					n->limitOption = LIMIT_OPTION_COUNT;
+					n->offsetLoc = @1;
+					n->countLoc = -1;
+					n->optionLoc = -1;
 					$$ = n;
 				}
 		;
@@ -13186,6 +13220,9 @@ limit_clause:
 					n->limitOffset = NULL;
 					n->limitCount = $2;
 					n->limitOption = LIMIT_OPTION_COUNT;
+					n->offsetLoc = -1;
+					n->countLoc = @1;
+					n->optionLoc = -1;
 					$$ = n;
 				}
 			| LIMIT select_limit_value ',' select_offset_value
@@ -13211,6 +13248,9 @@ limit_clause:
 					n->limitOffset = NULL;
 					n->limitCount = $3;
 					n->limitOption = LIMIT_OPTION_COUNT;
+					n->offsetLoc = -1;
+					n->countLoc = @1;
+					n->optionLoc = -1;
 					$$ = n;
 				}
 			| FETCH first_or_next select_fetch_first_value row_or_rows WITH TIES
@@ -13220,6 +13260,9 @@ limit_clause:
 					n->limitOffset = NULL;
 					n->limitCount = $3;
 					n->limitOption = LIMIT_OPTION_WITH_TIES;
+					n->offsetLoc = -1;
+					n->countLoc = @1;
+					n->optionLoc = @5;
 					$$ = n;
 				}
 			| FETCH first_or_next row_or_rows ONLY
@@ -13229,6 +13272,9 @@ limit_clause:
 					n->limitOffset = NULL;
 					n->limitCount = makeIntConst(1, -1);
 					n->limitOption = LIMIT_OPTION_COUNT;
+					n->offsetLoc = -1;
+					n->countLoc = @1;
+					n->optionLoc = -1;
 					$$ = n;
 				}
 			| FETCH first_or_next row_or_rows WITH TIES
@@ -13238,6 +13284,9 @@ limit_clause:
 					n->limitOffset = NULL;
 					n->limitCount = makeIntConst(1, -1);
 					n->limitOption = LIMIT_OPTION_WITH_TIES;
+					n->offsetLoc = -1;
+					n->countLoc = @1;
+					n->optionLoc = @4;
 					$$ = n;
 				}
 		;
@@ -13443,6 +13492,7 @@ values_clause:
 				{
 					SelectStmt *n = makeNode(SelectStmt);
 
+					n->stmt_location = @1;
 					n->valuesLists = list_make1($3);
 					$$ = (Node *) n;
 				}
@@ -16949,8 +16999,9 @@ json_format_clause:
 						encoding = JS_ENC_UTF32;
 					else
 						ereport(ERROR,
-								errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-								errmsg("unrecognized JSON encoding: %s", $4));
+								(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
+								 errmsg("unrecognized JSON encoding: %s", $4),
+								 parser_errposition(@4)));
 
 					$$ = (Node *) makeJsonFormat(JS_FORMAT_JSON, encoding, @1);
 				}
@@ -17452,7 +17503,8 @@ PLpgSQL_Expr: opt_distinct_clause opt_target_list
 							$9->limitOption == LIMIT_OPTION_WITH_TIES)
 							ereport(ERROR,
 									(errcode(ERRCODE_SYNTAX_ERROR),
-									 errmsg("WITH TIES cannot be specified without ORDER BY clause")));
+									 errmsg("WITH TIES cannot be specified without ORDER BY clause"),
+									 parser_errposition($9->optionLoc)));
 						n->limitOption = $9->limitOption;
 					}
 					n->lockingClause = $10;
@@ -18585,6 +18637,47 @@ updateRawStmtEnd(RawStmt *rs, int end_location)
 	rs->stmt_len = end_location - rs->stmt_location;
 }
 
+/*
+ * Adjust a PreparableStmt to reflect that it doesn't run to the end of the
+ * string.
+ */
+static void
+updatePreparableStmtEnd(Node *n, int end_location)
+{
+	if (IsA(n, SelectStmt))
+	{
+		SelectStmt *stmt = (SelectStmt *)n;
+
+		stmt->stmt_len = end_location - stmt->stmt_location;
+	}
+	else if (IsA(n, InsertStmt))
+	{
+		InsertStmt *stmt = (InsertStmt *)n;
+
+		stmt->stmt_len = end_location - stmt->stmt_location;
+	}
+	else if (IsA(n, UpdateStmt))
+	{
+		UpdateStmt *stmt = (UpdateStmt *)n;
+
+		stmt->stmt_len = end_location - stmt->stmt_location;
+	}
+	else if (IsA(n, DeleteStmt))
+	{
+		DeleteStmt *stmt = (DeleteStmt *)n;
+
+		stmt->stmt_len = end_location - stmt->stmt_location;
+	}
+	else if (IsA(n, MergeStmt))
+	{
+		MergeStmt *stmt = (MergeStmt *)n;
+
+		stmt->stmt_len = end_location - stmt->stmt_location;
+	}
+	else
+		elog(ERROR, "unexpected node type %d", (int) n->type);
+}
+
 static Node *
 makeColumnRef(char *colname, List *indirection,
 			  int location, core_yyscan_t yyscanner)
@@ -18868,7 +18961,7 @@ makeOrderedSetArgs(List *directargs, List *orderedargs,
 			ereport(ERROR,
 					(errcode(ERRCODE_FEATURE_NOT_SUPPORTED),
 					 errmsg("an ordered-set aggregate with a VARIADIC direct argument must have one VARIADIC aggregated argument of the same data type"),
-					 parser_errposition(exprLocation((Node *) firsto))));
+					 parser_errposition(firsto->location)));
 
 		/* OK, drop the duplicate VARIADIC argument from the internal form */
 		orderedargs = NIL;
@@ -18916,7 +19009,7 @@ insertSelectOptions(SelectStmt *stmt,
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("multiple OFFSET clauses not allowed"),
-					 parser_errposition(exprLocation(limitClause->limitOffset))));
+					 parser_errposition(limitClause->offsetLoc)));
 		stmt->limitOffset = limitClause->limitOffset;
 	}
 	if (limitClause && limitClause->limitCount)
@@ -18925,19 +19018,18 @@ insertSelectOptions(SelectStmt *stmt,
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
 					 errmsg("multiple LIMIT clauses not allowed"),
-					 parser_errposition(exprLocation(limitClause->limitCount))));
+					 parser_errposition(limitClause->countLoc)));
 		stmt->limitCount = limitClause->limitCount;
 	}
 	if (limitClause)
 	{
-		if (stmt->limitOption)
-			ereport(ERROR,
-					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("multiple limit options not allowed")));
+		/* If there was a conflict, we must have detected it above */
+		Assert(!stmt->limitOption);
 		if (!stmt->sortClause && limitClause->limitOption == LIMIT_OPTION_WITH_TIES)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("WITH TIES cannot be specified without ORDER BY clause")));
+					 errmsg("WITH TIES cannot be specified without ORDER BY clause"),
+					 parser_errposition(limitClause->optionLoc)));
 		if (limitClause->limitOption == LIMIT_OPTION_WITH_TIES && stmt->lockingClause)
 		{
 			ListCell   *lc;
@@ -18950,7 +19042,8 @@ insertSelectOptions(SelectStmt *stmt,
 					ereport(ERROR,
 							(errcode(ERRCODE_SYNTAX_ERROR),
 							 errmsg("%s and %s options cannot be used together",
-									"SKIP LOCKED", "WITH TIES")));
+									"SKIP LOCKED", "WITH TIES"),
+							 parser_errposition(limitClause->optionLoc)));
 			}
 		}
 		stmt->limitOption = limitClause->limitOption;
@@ -18963,11 +19056,14 @@ insertSelectOptions(SelectStmt *stmt,
 					 errmsg("multiple WITH clauses not allowed"),
 					 parser_errposition(exprLocation((Node *) withClause))));
 		stmt->withClause = withClause;
+
+		/* Update SelectStmt's location to the start of the WITH clause */
+		stmt->stmt_location = withClause->location;
 	}
 }
 
 static Node *
-makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg)
+makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg, int location)
 {
 	SelectStmt *n = makeNode(SelectStmt);
 
@@ -18975,6 +19071,7 @@ makeSetOp(SetOperation op, bool all, Node *larg, Node *rarg)
 	n->all = all;
 	n->larg = (SelectStmt *) larg;
 	n->rarg = (SelectStmt *) rarg;
+	n->stmt_location = location;
 	return (Node *) n;
 }
 
@@ -19139,7 +19236,7 @@ makeXmlExpr(XmlExprOp op, char *name, List *named_args, List *args,
  * Merge the input and output parameters of a table function.
  */
 static List *
-mergeTableFuncParameters(List *func_args, List *columns)
+mergeTableFuncParameters(List *func_args, List *columns, core_yyscan_t yyscanner)
 {
 	ListCell   *lc;
 
@@ -19153,7 +19250,8 @@ mergeTableFuncParameters(List *func_args, List *columns)
 			p->mode != FUNC_PARAM_VARIADIC)
 			ereport(ERROR,
 					(errcode(ERRCODE_SYNTAX_ERROR),
-					 errmsg("OUT and INOUT arguments aren't allowed in TABLE functions")));
+					 errmsg("OUT and INOUT arguments aren't allowed in TABLE functions"),
+					 parser_errposition(p->location)));
 	}
 
 	return list_concat(func_args, columns);
@@ -19374,7 +19472,7 @@ processCASbits(int cas_bits, int location, const char *constrType,
  * PartitionStrategy representation, or die trying.
  */
 static PartitionStrategy
-parsePartitionStrategy(char *strategy)
+parsePartitionStrategy(char *strategy, int location, core_yyscan_t yyscanner)
 {
 	if (pg_strcasecmp(strategy, "list") == 0)
 		return PARTITION_STRATEGY_LIST;
@@ -19385,8 +19483,8 @@ parsePartitionStrategy(char *strategy)
 
 	ereport(ERROR,
 			(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-			 errmsg("unrecognized partitioning strategy \"%s\"",
-					strategy)));
+			 errmsg("unrecognized partitioning strategy \"%s\"", strategy),
+			 parser_errposition(location)));
 	return PARTITION_STRATEGY_LIST;		/* keep compiler quiet */
 
 }

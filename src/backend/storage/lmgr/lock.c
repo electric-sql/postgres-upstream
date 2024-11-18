@@ -41,7 +41,6 @@
 #include "pg_trace.h"
 #include "storage/proc.h"
 #include "storage/procarray.h"
-#include "storage/sinvaladt.h"
 #include "storage/spin.h"
 #include "storage/standby.h"
 #include "utils/memutils.h"
@@ -410,8 +409,7 @@ static PROCLOCK *SetupLockInTable(LockMethod lockMethodTable, PGPROC *proc,
 static void GrantLockLocal(LOCALLOCK *locallock, ResourceOwner owner);
 static void BeginStrongLockAcquire(LOCALLOCK *locallock, uint32 fasthashcode);
 static void FinishStrongLockAcquire(void);
-static void WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner,
-					   bool dontWait);
+static ProcWaitStatus WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner);
 static void ReleaseLockIfHeld(LOCALLOCK *locallock, bool sessionLock);
 static void LockReassignOwner(LOCALLOCK *locallock, ResourceOwner parent);
 static bool UnGrantLock(LOCK *lock, LOCKMODE lockmode,
@@ -844,6 +842,7 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	uint32		hashcode;
 	LWLock	   *partitionLock;
 	bool		found_conflict;
+	ProcWaitStatus waitResult;
 	bool		log_lock = false;
 
 	if (lockmethodid <= 0 || lockmethodid >= lengthof(LockMethods))
@@ -1092,36 +1091,83 @@ LockAcquireExtended(const LOCKTAG *locktag,
 	{
 		/* No conflict with held or previously requested locks */
 		GrantLock(lock, proclock, lockmode);
-		GrantLockLocal(locallock, owner);
+		waitResult = PROC_WAIT_STATUS_OK;
 	}
 	else
 	{
 		/*
-		 * Set bitmask of locks this process already holds on this object.
+		 * Join the lock's wait queue.  We call this even in the dontWait
+		 * case, because JoinWaitQueue() may discover that we can acquire the
+		 * lock immediately after all.
 		 */
-		MyProc->heldLocks = proclock->holdMask;
+		waitResult = JoinWaitQueue(locallock, lockMethodTable, dontWait);
+	}
 
+	if (waitResult == PROC_WAIT_STATUS_ERROR)
+	{
 		/*
-		 * Sleep till someone wakes me up. We do this even in the dontWait
-		 * case, because while trying to go to sleep, we may discover that we
-		 * can acquire the lock immediately after all.
+		 * We're not getting the lock because a deadlock was detected already
+		 * while trying to join the wait queue, or because we would have to
+		 * wait but the caller requested no blocking.
+		 *
+		 * Undo the changes to shared entries before releasing the partition
+		 * lock.
 		 */
+		AbortStrongLockAcquire();
 
-		TRACE_POSTGRESQL_LOCK_WAIT_START(locktag->locktag_field1,
-										 locktag->locktag_field2,
-										 locktag->locktag_field3,
-										 locktag->locktag_field4,
-										 locktag->locktag_type,
-										 lockmode);
+		if (proclock->holdMask == 0)
+		{
+			uint32		proclock_hashcode;
 
-		WaitOnLock(locallock, owner, dontWait);
+			proclock_hashcode = ProcLockHashCode(&proclock->tag,
+												 hashcode);
+			dlist_delete(&proclock->lockLink);
+			dlist_delete(&proclock->procLink);
+			if (!hash_search_with_hash_value(LockMethodProcLockHash,
+											 &(proclock->tag),
+											 proclock_hashcode,
+											 HASH_REMOVE,
+											 NULL))
+				elog(PANIC, "proclock table corrupted");
+		}
+		else
+			PROCLOCK_PRINT("LockAcquire: did not join wait queue", proclock);
+		lock->nRequested--;
+		lock->requested[lockmode]--;
+		LOCK_PRINT("LockAcquire: did not join wait queue",
+				   lock, lockmode);
+		Assert((lock->nRequested > 0) &&
+			   (lock->requested[lockmode] >= 0));
+		Assert(lock->nGranted <= lock->nRequested);
+		LWLockRelease(partitionLock);
+		if (locallock->nLocks == 0)
+			RemoveLocalLock(locallock);
 
-		TRACE_POSTGRESQL_LOCK_WAIT_DONE(locktag->locktag_field1,
-										locktag->locktag_field2,
-										locktag->locktag_field3,
-										locktag->locktag_field4,
-										locktag->locktag_type,
-										lockmode);
+		if (dontWait)
+		{
+			if (locallockp)
+				*locallockp = NULL;
+			return LOCKACQUIRE_NOT_AVAIL;
+		}
+		else
+		{
+			DeadLockReport();
+			/* DeadLockReport() will not return */
+		}
+	}
+
+	/*
+	 * We are now in the lock queue, or the lock was already granted.  If
+	 * queued, go to sleep.
+	 */
+	if (waitResult == PROC_WAIT_STATUS_WAITING)
+	{
+		Assert(!dontWait);
+		PROCLOCK_PRINT("LockAcquire: sleeping on lock", proclock);
+		LOCK_PRINT("LockAcquire: sleeping on lock", lock, lockmode);
+		LWLockRelease(partitionLock);
+
+		waitResult = WaitOnLock(locallock, owner);
 
 		/*
 		 * NOTE: do not do any material change of state between here and
@@ -1129,76 +1175,30 @@ LockAcquireExtended(const LOCKTAG *locktag,
 		 * done when the lock was granted to us --- see notes in WaitOnLock.
 		 */
 
-		/*
-		 * Check the proclock entry status. If dontWait = true, this is an
-		 * expected case; otherwise, it will only happen if something in the
-		 * ipc communication doesn't work correctly.
-		 */
-		if (!(proclock->holdMask & LOCKBIT_ON(lockmode)))
+		if (waitResult == PROC_WAIT_STATUS_ERROR)
 		{
-			AbortStrongLockAcquire();
-
-			if (dontWait)
-			{
-				/*
-				 * We can't acquire the lock immediately.  If caller specified
-				 * no blocking, remove useless table entries and return
-				 * LOCKACQUIRE_NOT_AVAIL without waiting.
-				 */
-				if (proclock->holdMask == 0)
-				{
-					uint32		proclock_hashcode;
-
-					proclock_hashcode = ProcLockHashCode(&proclock->tag,
-														 hashcode);
-					dlist_delete(&proclock->lockLink);
-					dlist_delete(&proclock->procLink);
-					if (!hash_search_with_hash_value(LockMethodProcLockHash,
-													 &(proclock->tag),
-													 proclock_hashcode,
-													 HASH_REMOVE,
-													 NULL))
-						elog(PANIC, "proclock table corrupted");
-				}
-				else
-					PROCLOCK_PRINT("LockAcquire: NOWAIT", proclock);
-				lock->nRequested--;
-				lock->requested[lockmode]--;
-				LOCK_PRINT("LockAcquire: conditional lock failed",
-						   lock, lockmode);
-				Assert((lock->nRequested > 0) &&
-					   (lock->requested[lockmode] >= 0));
-				Assert(lock->nGranted <= lock->nRequested);
-				LWLockRelease(partitionLock);
-				if (locallock->nLocks == 0)
-					RemoveLocalLock(locallock);
-				if (locallockp)
-					*locallockp = NULL;
-				return LOCKACQUIRE_NOT_AVAIL;
-			}
-			else
-			{
-				/*
-				 * We should have gotten the lock, but somehow that didn't
-				 * happen. If we get here, it's a bug.
-				 */
-				PROCLOCK_PRINT("LockAcquire: INCONSISTENT", proclock);
-				LOCK_PRINT("LockAcquire: INCONSISTENT", lock, lockmode);
-				LWLockRelease(partitionLock);
-				elog(ERROR, "LockAcquire failed");
-			}
+			/*
+			 * We failed as a result of a deadlock, see CheckDeadLock(). Quit
+			 * now.
+			 */
+			Assert(!dontWait);
+			DeadLockReport();
+			/* DeadLockReport() will not return */
 		}
-		PROCLOCK_PRINT("LockAcquire: granted", proclock);
-		LOCK_PRINT("LockAcquire: granted", lock, lockmode);
 	}
+	else
+		LWLockRelease(partitionLock);
+	Assert(waitResult == PROC_WAIT_STATUS_OK);
+
+	/* The lock was granted to us.  Update the local lock entry accordingly */
+	Assert((proclock->holdMask & LOCKBIT_ON(lockmode)) != 0);
+	GrantLockLocal(locallock, owner);
 
 	/*
 	 * Lock state is fully up-to-date now; if we error out after this, no
 	 * special error cleanup is required.
 	 */
 	FinishStrongLockAcquire();
-
-	LWLockRelease(partitionLock);
 
 	/*
 	 * Emit a WAL record if acquisition of this lock needs to be replayed in a
@@ -1841,6 +1841,15 @@ GrantAwaitedLock(void)
 }
 
 /*
+ * GetAwaitedLock -- Return the lock we're currently doing WaitOnLock on.
+ */
+LOCALLOCK *
+GetAwaitedLock(void)
+{
+	return awaitedLock;
+}
+
+/*
  * MarkLockClear -- mark an acquired lock as "clear"
  *
  * This means that we know we have absorbed all sinval messages that other
@@ -1857,24 +1866,27 @@ MarkLockClear(LOCALLOCK *locallock)
 /*
  * WaitOnLock -- wait to acquire a lock
  *
- * Caller must have set MyProc->heldLocks to reflect locks already held
- * on the lockable object by this process.
- *
- * The appropriate partition lock must be held at entry, and will still be
- * held at exit.
+ * This is a wrapper around ProcSleep, with extra tracing and bookkeeping.
  */
-static void
-WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, bool dontWait)
+static ProcWaitStatus
+WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner)
 {
-	LOCKMETHODID lockmethodid = LOCALLOCK_LOCKMETHOD(*locallock);
-	LockMethod	lockMethodTable = LockMethods[lockmethodid];
+	ProcWaitStatus result;
 
-	LOCK_PRINT("WaitOnLock: sleeping on lock",
-			   locallock->lock, locallock->tag.mode);
+	TRACE_POSTGRESQL_LOCK_WAIT_START(locallock->tag.lock.locktag_field1,
+									 locallock->tag.lock.locktag_field2,
+									 locallock->tag.lock.locktag_field3,
+									 locallock->tag.lock.locktag_field4,
+									 locallock->tag.lock.locktag_type,
+									 locallock->tag.mode);
 
 	/* adjust the process title to indicate that it's waiting */
 	set_ps_display_suffix("waiting");
 
+	/*
+	 * Record the fact that we are waiting for a lock, so that
+	 * LockErrorCleanup will clean up if cancel/die happens.
+	 */
 	awaitedLock = locallock;
 	awaitedOwner = owner;
 
@@ -1897,30 +1909,7 @@ WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, bool dontWait)
 	 */
 	PG_TRY();
 	{
-		/*
-		 * If dontWait = true, we handle success and failure in the same way
-		 * here. The caller will be able to sort out what has happened.
-		 */
-		if (ProcSleep(locallock, lockMethodTable, dontWait) != PROC_WAIT_STATUS_OK
-			&& !dontWait)
-		{
-
-			/*
-			 * We failed as a result of a deadlock, see CheckDeadLock(). Quit
-			 * now.
-			 */
-			awaitedLock = NULL;
-			LOCK_PRINT("WaitOnLock: aborting on lock",
-					   locallock->lock, locallock->tag.mode);
-			LWLockRelease(LockHashPartitionLock(locallock->hashcode));
-
-			/*
-			 * Now that we aren't holding the partition lock, we can give an
-			 * error report including details about the detected deadlock.
-			 */
-			DeadLockReport();
-			/* not reached */
-		}
+		result = ProcSleep(locallock);
 	}
 	PG_CATCH();
 	{
@@ -1934,13 +1923,22 @@ WaitOnLock(LOCALLOCK *locallock, ResourceOwner owner, bool dontWait)
 	}
 	PG_END_TRY();
 
+	/*
+	 * We no longer want LockErrorCleanup to do anything.
+	 */
 	awaitedLock = NULL;
 
 	/* reset ps display to remove the suffix */
 	set_ps_display_remove_suffix();
 
-	LOCK_PRINT("WaitOnLock: wakeup on lock",
-			   locallock->lock, locallock->tag.mode);
+	TRACE_POSTGRESQL_LOCK_WAIT_DONE(locallock->tag.lock.locktag_field1,
+									locallock->tag.lock.locktag_field2,
+									locallock->tag.lock.locktag_field3,
+									locallock->tag.lock.locktag_field4,
+									locallock->tag.lock.locktag_type,
+									locallock->tag.mode);
+
+	return result;
 }
 
 /*
@@ -2259,9 +2257,8 @@ LockReleaseAll(LOCKMETHODID lockmethodid, bool allLocks)
 	while ((locallock = (LOCALLOCK *) hash_seq_search(&status)) != NULL)
 	{
 		/*
-		 * If the LOCALLOCK entry is unused, we must've run out of shared
-		 * memory while trying to set up this lock.  Just forget the local
-		 * entry.
+		 * If the LOCALLOCK entry is unused, something must've gone wrong
+		 * while trying to acquire this lock.  Just forget the local entry.
 		 */
 		if (locallock->nLocks == 0)
 		{
@@ -3731,44 +3728,55 @@ GetLockStatusData(void)
 	for (i = 0; i < ProcGlobal->allProcCount; ++i)
 	{
 		PGPROC	   *proc = &ProcGlobal->allProcs[i];
-		uint32		f;
+
+		/* Skip backends with pid=0, as they don't hold fast-path locks */
+		if (proc->pid == 0)
+			continue;
 
 		LWLockAcquire(&proc->fpInfoLock, LW_SHARED);
 
-		for (f = 0; f < FP_LOCK_SLOTS_PER_BACKEND; ++f)
+		for (uint32 g = 0; g < FastPathLockGroupsPerBackend; g++)
 		{
-			LockInstanceData *instance;
-			uint32		lockbits = FAST_PATH_GET_BITS(proc, f);
-
-			/* Skip unallocated slots. */
-			if (!lockbits)
+			/* Skip groups without registered fast-path locks */
+			if (proc->fpLockBits[g] == 0)
 				continue;
 
-			if (el >= els)
+			for (int j = 0; j < FP_LOCK_SLOTS_PER_GROUP; j++)
 			{
-				els += MaxBackends;
-				data->locks = (LockInstanceData *)
-					repalloc(data->locks, sizeof(LockInstanceData) * els);
+				LockInstanceData *instance;
+				uint32		f = FAST_PATH_SLOT(g, j);
+				uint32		lockbits = FAST_PATH_GET_BITS(proc, f);
+
+				/* Skip unallocated slots */
+				if (!lockbits)
+					continue;
+
+				if (el >= els)
+				{
+					els += MaxBackends;
+					data->locks = (LockInstanceData *)
+						repalloc(data->locks, sizeof(LockInstanceData) * els);
+				}
+
+				instance = &data->locks[el];
+				SET_LOCKTAG_RELATION(instance->locktag, proc->databaseId,
+									 proc->fpRelId[f]);
+				instance->holdMask = lockbits << FAST_PATH_LOCKNUMBER_OFFSET;
+				instance->waitLockMode = NoLock;
+				instance->vxid.procNumber = proc->vxid.procNumber;
+				instance->vxid.localTransactionId = proc->vxid.lxid;
+				instance->pid = proc->pid;
+				instance->leaderPid = proc->pid;
+				instance->fastpath = true;
+
+				/*
+				 * Successfully taking fast path lock means there were no
+				 * conflicting locks.
+				 */
+				instance->waitStart = 0;
+
+				el++;
 			}
-
-			instance = &data->locks[el];
-			SET_LOCKTAG_RELATION(instance->locktag, proc->databaseId,
-								 proc->fpRelId[f]);
-			instance->holdMask = lockbits << FAST_PATH_LOCKNUMBER_OFFSET;
-			instance->waitLockMode = NoLock;
-			instance->vxid.procNumber = proc->vxid.procNumber;
-			instance->vxid.localTransactionId = proc->vxid.lxid;
-			instance->pid = proc->pid;
-			instance->leaderPid = proc->pid;
-			instance->fastpath = true;
-
-			/*
-			 * Successfully taking fast path lock means there were no
-			 * conflicting locks.
-			 */
-			instance->waitStart = 0;
-
-			el++;
 		}
 
 		if (proc->fpVXIDLock)

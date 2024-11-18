@@ -67,8 +67,7 @@ relation_statistics_update(FunctionCallInfo fcinfo, int elevel)
 	bool		nulls[3] = {0};
 	int			ncols = 0;
 	TupleDesc	tupdesc;
-	HeapTuple	newtup;
-
+	bool		result = true;
 
 	stats_check_required_arg(fcinfo, relarginfo, RELATION_ARG);
 	reloid = PG_GETARG_OID(RELATION_ARG);
@@ -99,16 +98,19 @@ relation_statistics_update(FunctionCallInfo fcinfo, int elevel)
 	{
 		int32		relpages = PG_GETARG_INT32(RELPAGES_ARG);
 
-		if (relpages < 0)
+		/*
+		 * Partitioned tables may have relpages=-1. Note: for relations with
+		 * no storage, relpages=-1 is not used consistently, but must be
+		 * supported here.
+		 */
+		if (relpages < -1)
 		{
 			ereport(elevel,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
-					 errmsg("relpages cannot be < 0")));
-			table_close(crel, RowExclusiveLock);
-			return false;
+					 errmsg("relpages cannot be < -1")));
+			result = false;
 		}
-
-		if (relpages != pgcform->relpages)
+		else if (relpages != pgcform->relpages)
 		{
 			replaces[ncols] = Anum_pg_class_relpages;
 			values[ncols] = Int32GetDatum(relpages);
@@ -125,16 +127,15 @@ relation_statistics_update(FunctionCallInfo fcinfo, int elevel)
 			ereport(elevel,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("reltuples cannot be < -1.0")));
-			table_close(crel, RowExclusiveLock);
-			return false;
+			result = false;
 		}
-
-		if (reltuples != pgcform->reltuples)
+		else if (reltuples != pgcform->reltuples)
 		{
 			replaces[ncols] = Anum_pg_class_reltuples;
 			values[ncols] = Float4GetDatum(reltuples);
 			ncols++;
 		}
+
 	}
 
 	if (!PG_ARGISNULL(RELALLVISIBLE_ARG))
@@ -146,11 +147,9 @@ relation_statistics_update(FunctionCallInfo fcinfo, int elevel)
 			ereport(elevel,
 					(errcode(ERRCODE_INVALID_PARAMETER_VALUE),
 					 errmsg("relallvisible cannot be < 0")));
-			table_close(crel, RowExclusiveLock);
-			return false;
+			result = false;
 		}
-
-		if (relallvisible != pgcform->relallvisible)
+		else if (relallvisible != pgcform->relallvisible)
 		{
 			replaces[ncols] = Anum_pg_class_relallvisible;
 			values[ncols] = Int32GetDatum(relallvisible);
@@ -159,22 +158,22 @@ relation_statistics_update(FunctionCallInfo fcinfo, int elevel)
 	}
 
 	/* only update pg_class if there is a meaningful change */
-	if (ncols == 0)
+	if (ncols > 0)
 	{
-		table_close(crel, RowExclusiveLock);
-		return false;
+		HeapTuple	newtup;
+
+		newtup = heap_modify_tuple_by_cols(ctup, tupdesc, ncols, replaces, values,
+										   nulls);
+		CatalogTupleUpdate(crel, &newtup->t_self, newtup);
+		heap_freetuple(newtup);
 	}
-
-	newtup = heap_modify_tuple_by_cols(ctup, tupdesc, ncols, replaces, values,
-									   nulls);
-
-	CatalogTupleUpdate(crel, &newtup->t_self, newtup);
-	heap_freetuple(newtup);
 
 	/* release the lock, consistent with vac_update_relstats() */
 	table_close(crel, RowExclusiveLock);
 
-	return true;
+	CommandCounterIncrement();
+
+	return result;
 }
 
 /*
@@ -183,7 +182,8 @@ relation_statistics_update(FunctionCallInfo fcinfo, int elevel)
 Datum
 pg_set_relation_stats(PG_FUNCTION_ARGS)
 {
-	PG_RETURN_BOOL(relation_statistics_update(fcinfo, ERROR));
+	relation_statistics_update(fcinfo, ERROR);
+	PG_RETURN_VOID();
 }
 
 /*
@@ -206,5 +206,26 @@ pg_clear_relation_stats(PG_FUNCTION_ARGS)
 	newfcinfo->args[3].value = DEFAULT_RELALLVISIBLE;
 	newfcinfo->args[3].isnull = false;
 
-	PG_RETURN_BOOL(relation_statistics_update(newfcinfo, ERROR));
+	relation_statistics_update(newfcinfo, ERROR);
+	PG_RETURN_VOID();
+}
+
+Datum
+pg_restore_relation_stats(PG_FUNCTION_ARGS)
+{
+	LOCAL_FCINFO(positional_fcinfo, NUM_RELATION_STATS_ARGS);
+	bool		result = true;
+
+	InitFunctionCallInfoData(*positional_fcinfo, NULL,
+							 NUM_RELATION_STATS_ARGS,
+							 InvalidOid, NULL, NULL);
+
+	if (!stats_fill_fcinfo_from_arg_pairs(fcinfo, positional_fcinfo,
+										  relarginfo, WARNING))
+		result = false;
+
+	if (!relation_statistics_update(positional_fcinfo, WARNING))
+		result = false;
+
+	PG_RETURN_BOOL(result);
 }

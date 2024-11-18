@@ -105,7 +105,6 @@
 #include "access/xlog.h"
 #include "lib/dshash.h"
 #include "pgstat.h"
-#include "port/atomics.h"
 #include "storage/fd.h"
 #include "storage/ipc.h"
 #include "storage/lwlock.h"
@@ -938,6 +937,9 @@ pgstat_fetch_entry(PgStat_Kind kind, Oid dboid, uint64 objid)
 	Assert(!kind_info->fixed_amount);
 
 	pgstat_prep_snapshot();
+
+	/* clear padding */
+	memset(&key, 0, sizeof(struct PgStat_HashKey));
 
 	key.kind = kind;
 	key.dboid = dboid;

@@ -414,9 +414,6 @@ CREATE OR REPLACE FUNCTION
   json_populate_recordset(base anyelement, from_json json, use_json_as_text boolean DEFAULT false)
   RETURNS SETOF anyelement LANGUAGE internal STABLE ROWS 100  AS 'json_populate_recordset' PARALLEL SAFE;
 
-CREATE OR REPLACE PROCEDURE pg_wal_replay_wait(target_lsn pg_lsn, timeout int8 DEFAULT 0)
-  LANGUAGE internal AS 'pg_wal_replay_wait';
-
 CREATE OR REPLACE FUNCTION pg_logical_slot_get_changes(
     IN slot_name name, IN upto_lsn pg_lsn, IN upto_nchanges int, VARIADIC options text[] DEFAULT '{}',
     OUT lsn pg_lsn, OUT xid xid, OUT data text)
@@ -644,10 +641,32 @@ CREATE OR REPLACE FUNCTION
                         relpages integer DEFAULT NULL,
                         reltuples real DEFAULT NULL,
                         relallvisible integer DEFAULT NULL)
-RETURNS bool
+RETURNS void
 LANGUAGE INTERNAL
 CALLED ON NULL INPUT VOLATILE
 AS 'pg_set_relation_stats';
+
+CREATE OR REPLACE FUNCTION
+  pg_set_attribute_stats(relation regclass,
+                         attname name,
+                         inherited bool,
+                         null_frac real DEFAULT NULL,
+                         avg_width integer DEFAULT NULL,
+                         n_distinct real DEFAULT NULL,
+                         most_common_vals text DEFAULT NULL,
+                         most_common_freqs real[] DEFAULT NULL,
+                         histogram_bounds text DEFAULT NULL,
+                         correlation real DEFAULT NULL,
+                         most_common_elems text DEFAULT NULL,
+                         most_common_elem_freqs real[] DEFAULT NULL,
+                         elem_count_histogram real[] DEFAULT NULL,
+                         range_length_histogram text DEFAULT NULL,
+                         range_empty_frac real DEFAULT NULL,
+                         range_bounds_histogram text DEFAULT NULL)
+RETURNS void
+LANGUAGE INTERNAL
+CALLED ON NULL INPUT VOLATILE
+AS 'pg_set_attribute_stats';
 
 --
 -- The default permissions for functions mean that anyone can execute them.
