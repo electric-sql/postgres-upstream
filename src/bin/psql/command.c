@@ -5146,6 +5146,10 @@ do_shell(const char *command)
 static bool
 do_watch(PQExpBuffer query_buf, double sleep, int iter)
 {
+#if defined(__wasi__)
+    pg_log_error("#5150 wasi: could not set timer");
+    return false;
+#else
 	long		sleep_ms = (long) (sleep * 1000);
 	printQueryOpt myopt = pset.popt;
 	const char *strftime_fmt;
@@ -5384,6 +5388,7 @@ do_watch(PQExpBuffer query_buf, double sleep, int iter)
 
 	pg_free(title);
 	return (res >= 0);
+#endif /* __wasi__ */
 }
 
 /*
