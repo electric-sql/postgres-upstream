@@ -1166,7 +1166,7 @@ extern void AsyncPostgresSingleUserMain(int single_argc, char *single_argv[], co
 
 #if defined(__wasi__)
 
-//#   include "../patches/wasi_signal.c"
+//#   include "wasi_signal.c"
 
 #   define PG_INITDB_MAIN
 #   define PG_MAIN
