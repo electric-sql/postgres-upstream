@@ -8,7 +8,6 @@ echo "======== Building all PGlite prerequisites =========="
 
 apt update && apt install -y build-essential libreadline-dev zlib1g-dev bison flex git
 export FLEX=`which flex`
-$FLEX --version
 
 . ./cibuild.sh
 
