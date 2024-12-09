@@ -4,7 +4,7 @@ echo "======== Building all PGlite prerequisites using Docker =========="
 
 trap 'echo caught interrupt and exiting;' INT
 
-source .buildconfig
+source ./pglite/.buildconfig
 
 if [[ -z "$SDK_VERSION" || -z "$PG_VERSION" ]]; then
   echo "Missing SDK_VERSION and PG_VERSION env vars."
@@ -22,12 +22,15 @@ docker run \
   -e OBJDUMP=${OBJDUMP:-true} \
   -e SDK_ARCHIVE \
   -e WASI_SDK_ARCHIVE \
-  -v ./cibuild.sh:/workspace/cibuild.sh:rw \
-  -v ./.buildconfig:/workspace/.buildconfig:rw \
-  -v ./extra:/workspace/extra:rw \
-  -v ./cibuild:/workspace/cibuild:rw \
-  -v ./patches:/workspace/patches:rw \
-  -v ./tests:/workspace/tests:rw \
-  # -v ./packages/pglite:/workspace/packages/pglite:rw \
+  -e PGSRC=/workspace/postgres-src \
+  -e POSTGRES_PGLITE_OUT=/workspace/dist \
+  -v ./pglite/cibuild.sh:/workspace/cibuild.sh:rw \
+  -v ./pglite/.buildconfig:/workspace/.buildconfig:rw \
+  -v ./pglite/extra:/workspace/extra:rw \
+  -v ./pglite/cibuild:/workspace/cibuild:rw \
+  -v ./pglite/patches:/workspace/patches:rw \
+  -v ./pglite/tests:/workspace/tests:rw \
+  -v .:/workspace/postgres-src \
+  -v ./pglite/dist:/workspace/dist \
   $IMG_NAME:$IMG_TAG \
   bash ./cibuild/build-all.sh

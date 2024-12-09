@@ -24,7 +24,8 @@ docker run \
   -e OBJDUMP=${OBJDUMP:-true} \
   -e SDK_ARCHIVE \
   -e WASI_SDK_ARCHIVE \
-  -e PGSRC=/workspace/postgres-src\
+  -e PGSRC=/workspace/postgres-src \
+  -e POSTGRES_PGLITE_OUT=/workspace/dist \
   -v ./pglite/cibuild.sh:/workspace/cibuild.sh:rw \
   -v ./pglite/.buildconfig:/workspace/.buildconfig:rw \
   -v ./pglite/extra:/workspace/extra:rw \
@@ -32,5 +33,6 @@ docker run \
   -v ./pglite/patches:/workspace/patches:rw \
   -v ./pglite/tests:/workspace/tests:rw \
   -v .:/workspace/postgres-src \
+  -v ./pglite/dist:/workspace/dist \
   $IMG_NAME:$IMG_TAG \
   # bash ./cibuild/build-all.sh

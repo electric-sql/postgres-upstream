@@ -550,6 +550,15 @@ ________________________________________________________________________________
             cp -vf ${WEBROOT}/postgres.{js,data,wasm} $PGLITE/release/
         ;;
 
+        postgres-pglite-dist) echo "==================== postgres-pglite-dist  =========================="
+            mkdir -p ${POSTGRES_PGLITE_OUT}
+            #rm $PGLITE/release/*
+
+            # copy packed extensions
+            cp -vf ${WEBROOT}/*.tar.gz ${POSTGRES_PGLITE_OUT}
+            cp -vf ${WEBROOT}/postgres.{js,data,wasm} ${POSTGRES_PGLITE_OUT}
+        ;;        
+
         pglite-bundle-interim) echo "================== pglite-bundle-interim ======================"
             tar -cpRz ${PGLITE}/release > /tmp/sdk/pglite-interim-${PG_VERSION}.tar.gz
         ;;

@@ -16,4 +16,4 @@ $FLEX --version
 . ./cibuild.sh extra
 . ./cibuild.sh node
 . ./cibuild.sh linkweb
-. ./cibuild.sh pglite-prep
+. ./cibuild.sh postgres-pglite-dist
