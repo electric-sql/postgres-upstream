@@ -2068,6 +2068,9 @@ connectFailureMessage(PGconn *conn, int errorno)
 static int
 useKeepalives(PGconn *conn)
 {
+#if defined(__EMSCRIPTEN__) || defined(__wasi__)
+return 0;
+#else
 	int			val;
 
 	if (conn->keepalives == NULL)
