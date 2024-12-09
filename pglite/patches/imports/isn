@@ -1,0 +1,17 @@
+_pstrdup
+_memset
+_strncmp
+_strlen
+_pg_snprintf
+_errstart_cold
+_errcode
+_errmsg
+_errfinish
+_puts
+_Int64GetDatum
+_toupper
+_memcmp
+_errsave_start
+_errsave_finish
+___stack_pointer
+___memory_base

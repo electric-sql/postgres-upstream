@@ -1,0 +1,9 @@
+_relation_open
+_errstart_cold
+_errcode
+_errmsg
+_errfinish
+_puts
+_GetRecordedFreeSpace
+_relation_close
+___memory_base
