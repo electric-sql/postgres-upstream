@@ -426,8 +426,9 @@ then
 
     # build web version
     echo "========== linkweb : $(pwd) =================="
+    currdir=$(realpath .)
     pushd build/postgres
-        . $WORKSPACE/cibuild/linkweb.sh
+        . $currdir/cibuild/linkweb.sh
     popd
 fi
 
@@ -553,6 +554,8 @@ ________________________________________________________________________________
         postgres-pglite-dist) echo "==================== postgres-pglite-dist  =========================="
             mkdir -p ${POSTGRES_PGLITE_OUT}
             #rm $PGLITE/release/*
+
+            ls ${WEBROOT} -lah
 
             # copy packed extensions
             cp -vf ${WEBROOT}/*.tar.gz ${POSTGRES_PGLITE_OUT}
