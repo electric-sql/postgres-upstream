@@ -13,7 +13,8 @@ chmod +x ./extra/*.sh cibuild/*.sh
 export PG_VERSION SDK_VERSION WASI_SDK_VERSION SDKROOT
 
 export PG_VERSION=${PG_VERSION:-16.4}
-export WORKSPACE=${GITHUB_WORKSPACE:-$(pwd)}
+# export WORKSPACE=${GITHUB_WORKSPACE:-$(pwd)}
+export WORKSPACE=$(pwd)
 export PGROOT=${PGROOT:-/tmp/pglite}
 export WEBROOT=${WEBROOT:-/tmp/web}
 export DEBUG=${DEBUG:-false}
@@ -426,9 +427,8 @@ then
 
     # build web version
     echo "========== linkweb : $(pwd) =================="
-    currdir=$(realpath .)
     pushd build/postgres
-        . $currdir/cibuild/linkweb.sh
+        . $WORKSPACE/cibuild/linkweb.sh
     popd
 fi
 
