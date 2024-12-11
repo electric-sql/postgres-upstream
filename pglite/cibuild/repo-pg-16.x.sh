@@ -1,14 +1,6 @@
 
 PG_VERSION=16.4
 PG_PREREL=false
-# export PGSRC=$(realpath postgresql-${PG_VERSION})../../
-# export PGSRC=/workspace/postgres-src
-
-# if [ -d postgresql-${PG_VERSION} ]; then
-#     echo "postgresql-${PG_VERSION} exists."
-# else
-#     git clone --single-branch --branch=tudor/test-postgres-pglite-16.4 https://github.com/electric-sql/postgres-pglite.git postgresql-${PG_VERSION} || exit 29
-# fi
 
 # these are files that shadow original portion of pg core, with minimal changes
 # to original code
